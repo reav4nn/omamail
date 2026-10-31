@@ -72,9 +72,27 @@ pub fn safe_filename(name: &str, fallback: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned: String = base.chars().filter(|c| !c.is_control() && !is_format_char(*c)).collect();
     let cleaned = cleaned.trim_start_matches(|c: char| c == '.' || c.is_whitespace()).trim_end();
-    let cleaned: String = cleaned.chars().take(180).collect();
-    if cleaned.is_empty() { fallback.to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        return fallback.to_string();
+    }
+    if cleaned.chars().count() <= MAX_NAME_CHARS {
+        return cleaned.to_string();
+    }
+    // Cut the stem, not the extension: a plain cut drops the real
+    // extension and may end on one from the middle of the name. Without a
+    // real (short) extension the cut ends in "…".
+    let (stem, ext) = match cleaned.rfind('.') {
+        Some(i) if i > 0 && cleaned.len() - i <= 16 => (&cleaned[..i], &cleaned[i..]),
+        _ => (cleaned, ""),
+    };
+    let mark = if ext.is_empty() { "…" } else { "" };
+    let keep = MAX_NAME_CHARS - ext.chars().count() - mark.chars().count();
+    let stem: String = stem.chars().take(keep).collect();
+    let stem = stem.trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+    format!("{stem}{mark}{ext}")
 }
+
+const MAX_NAME_CHARS: usize = 180;
 
 fn attachment_name(part: &MessagePart, index: usize, mime: &str) -> String {
     let fallback = match &part.body {
@@ -444,5 +462,21 @@ Content-Transfer-Encoding: base64\r\n\
         assert_eq!(safe_filename(". .", "f"), "f");
         assert_eq!(safe_filename(".\u{3000}.config", "f"), "config");
         assert_eq!(prefixed("RE: x", "Re"), "RE: x");
+    }
+
+    #[test]
+    fn long_filenames_keep_their_extension() {
+        let long = format!("{}.pdf", "Quarterly report ".repeat(12).trim_end());
+        let name = safe_filename(&long, "f");
+        assert!(name.starts_with("Quarterly report") && name.ends_with("Quarte.pdf") && name.chars().count() == 180, "{name}");
+        // The cut must not land on an extension from the middle of the name.
+        let inner = format!("{}.pdf{}", "a".repeat(176), "b".repeat(40));
+        let name = safe_filename(&inner, "f");
+        assert!(name.ends_with('…') && !name.contains(".pdf") && name.chars().count() <= 180, "{name}");
+        let tight = format!("{}.exe", "c".repeat(200));
+        let name = safe_filename(&tight, "f");
+        assert!(name.ends_with("c.exe") && name.chars().count() == 180, "{name}");
+        let exact = format!("{}.txt", "d".repeat(176));
+        assert_eq!(safe_filename(&exact, "f"), exact);
     }
 }
