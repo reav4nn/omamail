@@ -267,7 +267,9 @@ pub fn draft(raw: &[u8], mode: &str, me: &str) -> Option<Draft> {
     let reply_to = deliverable(people(msg.reply_to()));
     let to = people(msg.to());
     let cc = deliverable(people(msg.cc()));
-    let subject = msg.subject().unwrap_or_default();
+    // An encoded word can decode to a line break or a bidi override; the
+    // reader drops them, and so must the subject field and forward header.
+    let subject = &display_text(msg.subject().unwrap_or_default());
     let date = msg.date().map(|d| d.to_rfc822()).unwrap_or_default();
     let text = msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default();
     let not_me = |p: &&Person| !p.email.eq_ignore_ascii_case(me) && !p.email.is_empty();
@@ -440,6 +442,23 @@ To: me@gmail.com, <b@x.az,evil@e.az>, Leyla <leyla@x.az>\r\nCc: R <r@x.az evil@e
         assert_eq!(d.subject, "Fwd: Görüş");
         assert!(d.to.is_empty() && d.in_reply_to.is_empty());
         assert_eq!(d.attachments, vec!["bashrc"]);
+    }
+
+    #[test]
+    fn encoded_subject_line_breaks_stay_out_of_drafts() {
+        // "Invoice\r\nFrom: CEO <ceo@bank.az>" plus a bidi override, hidden
+        // in an encoded word: the header itself has no line break.
+        let mail = b"From: Ali <ali@x.az>\r\nTo: me@gmail.com\r\n\
+Subject: =?UTF-8?B?SW52b2ljZQ0KRnJvbTogQ0VPIDxjZW9AYmFuay5hej7igK4=?=\r\n\r\nbody\r\n";
+        assert_eq!(render(mail, 1, false).subject, "InvoiceFrom: CEO <ceo@bank.az>");
+        let reply = draft(mail, "reply", "me@gmail.com").unwrap();
+        assert_eq!(reply.subject, "Re: InvoiceFrom: CEO <ceo@bank.az>");
+        // The reply must still be sendable: send refuses a subject with a line break.
+        assert!(!reply.subject.contains(['\r', '\n']), "{:?}", reply.subject);
+        let fwd = draft(mail, "forward", "me@gmail.com").unwrap();
+        assert_eq!(fwd.subject, "Fwd: InvoiceFrom: CEO <ceo@bank.az>");
+        // The quoted header block gains no forged "From:" line.
+        assert_eq!(fwd.body.lines().filter(|l| l.starts_with("From:")).count(), 1, "{}", fwd.body);
     }
 
     #[test]
