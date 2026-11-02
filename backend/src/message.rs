@@ -243,6 +243,14 @@ fn format_people(list: &[Person]) -> String {
         .join(", ")
 }
 
+/// Addresses a reply can go to. The parser keeps a crafted `<a@x, b@y>` as
+/// one address; written into the recipient field it would become two
+/// recipients, or with a name break the field. Anything that is not exactly
+/// one address is left out (sending could not use it either).
+fn deliverable(list: Vec<Person>) -> Vec<Person> {
+    list.into_iter().filter(|p| p.email.parse::<lettre::Address>().is_ok()).collect()
+}
+
 fn prefixed(subject: &str, prefix: &str) -> String {
     let lower = subject.trim_start().to_ascii_lowercase();
     if lower.starts_with(&format!("{}:", prefix.to_ascii_lowercase())) {
@@ -256,9 +264,9 @@ fn prefixed(subject: &str, prefix: &str) -> String {
 pub fn draft(raw: &[u8], mode: &str, me: &str) -> Option<Draft> {
     let msg = parse(raw)?;
     let from = people(msg.from());
-    let reply_to = people(msg.reply_to());
+    let reply_to = deliverable(people(msg.reply_to()));
     let to = people(msg.to());
-    let cc = people(msg.cc());
+    let cc = deliverable(people(msg.cc()));
     let subject = msg.subject().unwrap_or_default();
     let date = msg.date().map(|d| d.to_rfc822()).unwrap_or_default();
     let text = msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default();
@@ -295,7 +303,8 @@ pub fn draft(raw: &[u8], mode: &str, me: &str) -> Option<Draft> {
         });
     }
 
-    let mut primary = if reply_to.is_empty() { from.clone() } else { reply_to };
+    let to = deliverable(to);
+    let mut primary = if reply_to.is_empty() { deliverable(from.clone()) } else { reply_to };
     // Replying to your own sent mail goes to its recipients, not to you.
     if !primary.is_empty() && primary.iter().all(|p| p.email.eq_ignore_ascii_case(me)) {
         let others: Vec<Person> = to.iter().filter(not_me).cloned().collect();
@@ -403,6 +412,26 @@ JVBERi0=\r\n\
         let parsed = crate::send::parse_recipients(&text).unwrap();
         let emails: Vec<String> = parsed.iter().map(|m| m.email.to_string()).collect();
         assert_eq!(emails, vec!["real@z.az", "q@z.az", "r@z.az"], "{text}");
+    }
+
+    #[test]
+    fn crafted_addresses_add_no_recipients() {
+        // The parser keeps "a@x.az, evil@e.az" as one address; written out
+        // bare it would be two recipients, and with a name it breaks the
+        // whole field.
+        let mail = b"From: <a@x.az, evil@e.az>\r\nReply-To: Ali <ali@x.az>, Z <z@x.az; evil@e.az>\r\n\
+To: me@gmail.com, <b@x.az,evil@e.az>, Leyla <leyla@x.az>\r\nCc: R <r@x.az evil@e.az>\r\nSubject: s\r\n\r\nbody\r\n";
+        let emails = |field: &str| -> Vec<String> {
+            crate::send::parse_recipients(field).unwrap().iter().map(|m| m.email.to_string()).collect()
+        };
+        let d = draft(mail, "reply", "me@gmail.com").unwrap();
+        assert_eq!(emails(&d.to), vec!["ali@x.az"], "{}", d.to);
+        let d = draft(mail, "reply_all", "me@gmail.com").unwrap();
+        assert_eq!(emails(&d.to), vec!["ali@x.az", "leyla@x.az"], "{}", d.to);
+        assert_eq!(emails(&d.cc), Vec::<String>::new(), "{}", d.cc);
+        let lone = b"From: <a@x.az, evil@e.az>\r\nTo: me@gmail.com\r\nSubject: s\r\n\r\nbody\r\n";
+        let d = draft(lone, "reply", "me@gmail.com").unwrap();
+        assert!(!d.to.contains("evil"), "{}", d.to);
     }
 
     #[test]
