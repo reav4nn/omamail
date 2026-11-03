@@ -260,6 +260,14 @@ fn prefixed(subject: &str, prefix: &str) -> String {
     }
 }
 
+/// `<id>` for In-Reply-To and References. The parser keeps a folded id
+/// ("<abc\r\n def@x>") with its line break, which sending refuses, so the
+/// reply could not be sent at all; an id is one token or it is left out.
+fn thread_id(id: &str) -> Option<String> {
+    let valid = !id.is_empty() && !id.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>'));
+    valid.then(|| format!("<{id}>"))
+}
+
 /// `mode`: "reply", "reply_all" or "forward". `me` is left out of recipients.
 pub fn draft(raw: &[u8], mode: &str, me: &str) -> Option<Draft> {
     let msg = parse(raw)?;
@@ -274,13 +282,13 @@ pub fn draft(raw: &[u8], mode: &str, me: &str) -> Option<Draft> {
     let text = msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default();
     let not_me = |p: &&Person| !p.email.eq_ignore_ascii_case(me) && !p.email.is_empty();
 
-    let message_id = msg.message_id().map(|id| format!("<{id}>")).unwrap_or_default();
+    let message_id = msg.message_id().and_then(thread_id).unwrap_or_default();
     let mut references: Vec<String> = msg
         .references()
         .as_text_list()
-        .map(|l| l.iter().map(|r| format!("<{r}>")).collect())
-        .or_else(|| msg.references().as_text().map(|r| vec![format!("<{r}>")]))
-        .or_else(|| msg.in_reply_to().as_text().map(|r| vec![format!("<{r}>")]))
+        .map(|l| l.iter().filter_map(|r| thread_id(r)).collect())
+        .or_else(|| msg.references().as_text().map(|r| thread_id(r).into_iter().collect()))
+        .or_else(|| msg.in_reply_to().as_text().map(|r| thread_id(r).into_iter().collect()))
         .unwrap_or_default();
     if !message_id.is_empty() {
         references.push(message_id.clone());
@@ -526,5 +534,19 @@ Content-Transfer-Encoding: base64\r\n\
         assert!(name.ends_with("c.exe") && name.chars().count() == 180, "{name}");
         let exact = format!("{}.txt", "d".repeat(176));
         assert_eq!(safe_filename(&exact, "f"), exact);
+    }
+
+    #[test]
+    fn folded_message_ids_do_not_block_replies() {
+        // Sending refuses In-Reply-To and References with line breaks, so a
+        // reply to this mail could not be sent at all.
+        let mail = b"From: Ali <ali@x.az>\r\nTo: me@gmail.com\r\nSubject: s\r\n\
+Message-ID: <abc\r\n def@x.az>\r\n\
+References: <root@x.az>\r\n <mid\r\n\tdle@x.az>\r\n\r\nbody\r\n";
+        let d = draft(mail, "reply", "me@gmail.com").unwrap();
+        assert!(!d.in_reply_to.contains(['\r', '\n']), "{:?}", d.in_reply_to);
+        assert!(!d.references.contains(['\r', '\n']), "{:?}", d.references);
+        assert_eq!(d.in_reply_to, "");
+        assert_eq!(d.references, "<root@x.az>");
     }
 }
