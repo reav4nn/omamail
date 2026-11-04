@@ -9,6 +9,7 @@
 //! (the diff to review and accept) before it rebuilds anything.
 
 use crate::config::{self, state_dir};
+use crate::mailbox::is_format_char;
 use crate::watch::{GLYPH, PLUGIN_ID, markup_escape, send_notification};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -101,13 +102,10 @@ fn pending(cache: &Path, head: &str) -> Option<Pending> {
 /// control, bidi or invisible characters that could make them read as
 /// something else (a fake extra line, reversed text).
 fn clean_subject(s: &str) -> String {
-    let hidden = |c: char| {
-        matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
-    };
     let kept: String = s
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|&c| !c.is_control() && !hidden(c))
+        .filter(|&c| !c.is_control() && !is_format_char(c))
         .collect();
     match kept.char_indices().nth(MAX_SUBJECT_CHARS) {
         Some((i, _)) => format!("{}…", &kept[..i]),
@@ -225,6 +223,13 @@ mod tests {
         let long = "ə".repeat(MAX_SUBJECT_CHARS + 5);
         assert_eq!(clean_subject(&long), format!("{}…", "ə".repeat(MAX_SUBJECT_CHARS)));
         assert_eq!(clean_subject(&"a".repeat(MAX_SUBJECT_CHARS)), "a".repeat(MAX_SUBJECT_CHARS));
+    }
+
+    #[test]
+    fn subjects_drop_every_invisible_format_character() {
+        // Tag characters spell out hidden text; the others render as nothing.
+        let hidden = "\u{e0001}\u{e0069}\u{e0067}\u{e006e}\u{2060}\u{2063}\u{ad}\u{180e}\u{fff9}\u{1bca0}\u{1d173}";
+        assert_eq!(clean_subject(&format!("Fix{hidden} sync")), "Fix sync");
     }
 
     #[test]
