@@ -9,7 +9,7 @@
 
 **A light, keyboard-driven Gmail client for the Omarchy shell.**
 
-[![Version](https://img.shields.io/badge/version-1.2.2-blue)](manifest.json)
+[![Version](https://img.shields.io/badge/version-1.2.10-blue)](manifest.json)
 [![Platform](https://img.shields.io/badge/platform-Omarchy-1793d1)](https://omarchy.org)
 [![Backend](https://img.shields.io/badge/backend-Rust-b7410e)](backend)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
@@ -74,13 +74,15 @@ and uses about 7 MB of memory.
 |---|---|
 | **Desktop** | [Omarchy](https://omarchy.org) with `omarchy-shell`. The panel is built from the shell's components, so other desktops need a port. |
 | **Account** | A Gmail account with 2-Step Verification and an [app password](https://myaccount.google.com/apppasswords). |
-| **Build** | Rust, installed with `omarchy install dev-env rust`. |
-| **Attachments** | zenity, to pick files to attach: `omarchy pkg add zenity`. |
+| **Build** | Rust and Cargo, available through Omarchy’s development tools. |
+| **Attachments** | zenity, for the attachment file picker. |
+
+Install these prerequisites before running `install.sh`.
 
 ## Installation
 
 ```bash
-omarchy plugin add https://github.com/hajizadaravan/omamail.git --enable
+omarchy plugin add https://github.com/reav4nn/omamail.git --enable
 ~/.config/omarchy/plugins/reavann.omamail/install.sh
 ```
 

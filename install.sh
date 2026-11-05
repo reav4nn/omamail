@@ -21,7 +21,7 @@ plugins_dir="$HOME/.config/omarchy/plugins"
 plugin_dir="$plugins_dir/reavann.omamail"
 
 if ! command -v cargo >/dev/null; then
-  echo "Rust is needed to build the backend. Install it with: omarchy install dev-env rust" >&2
+  echo "Rust and Cargo are needed to build the backend. Install them through Omarchy’s development tools first." >&2
   exit 1
 fi
 # --locked: an update that changes Cargo.toml without the reviewed lockfile
@@ -68,7 +68,7 @@ if ! omarchy plugin enable reavann.omamail >/dev/null; then
 fi
 
 if ! command -v zenity >/dev/null; then
-  echo "Note: attaching files needs zenity: omarchy pkg add zenity" >&2
+  echo "Note: install zenity to use the attachment file picker." >&2
 fi
 
 echo "Omamail installed. Open it from the app launcher, or with: omarchy-shell shell toggle reavann.omamail '{}'"
