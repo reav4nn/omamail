@@ -1,7 +1,11 @@
 [package]
 name = "omamail"
-version = "1.2.8"
+version = "1.2.9"
 edition = "2024"
+
+[workspace]
+members = ["vendor/imap-proto"]
+default-members = ["."]
 
 [dependencies]
 ammonia = "4"
@@ -29,3 +33,7 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# imap 2.4 needs the 0.10 API; keep its parser compatible with current Rust.
+[patch.crates-io]
+imap-proto = { path = "vendor/imap-proto" }
