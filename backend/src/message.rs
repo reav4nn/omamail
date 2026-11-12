@@ -96,7 +96,10 @@ const MAX_NAME_CHARS: usize = 180;
 
 fn attachment_name(part: &MessagePart, index: usize, mime: &str) -> String {
     let fallback = match &part.body {
-        PartType::Message(m) => format!("{}.eml", m.subject().unwrap_or("message")),
+        // A subject is not a path: "Invoice 3/2026" must not be cut to "2026".
+        PartType::Message(m) => {
+            format!("{}.eml", safe_filename(&m.subject().unwrap_or_default().replace(['/', '\\'], "-"), "message"))
+        }
         _ => {
             let ext = mime_guess::get_mime_extensions_str(mime).and_then(|e| e.first().copied()).unwrap_or("bin");
             format!("attachment-{}.{ext}", index + 1)
@@ -450,6 +453,39 @@ To: me@gmail.com, <b@x.az,evil@e.az>, Leyla <leyla@x.az>\r\nCc: R <r@x.az evil@e
         assert_eq!(d.subject, "Fwd: Görüş");
         assert!(d.to.is_empty() && d.in_reply_to.is_empty());
         assert_eq!(d.attachments, vec!["bashrc"]);
+    }
+
+    #[test]
+    fn unnamed_attached_mail_is_named_after_its_whole_subject() {
+        let mail = |subject: &str| {
+            format!(
+                "Subject: fwd\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=b\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+see attached\r\n\
+--b\r\n\
+Content-Type: message/rfc822\r\n\
+\r\n\
+From: a@x.az\r\n\
+Subject: {subject}\r\n\
+\r\n\
+inner\r\n\
+--b--\r\n"
+            )
+        };
+        let name = |subject: &str| attachment(mail(subject).as_bytes(), 0).map(|(name, _)| name);
+        assert_eq!(name("Report").as_deref(), Some("Report.eml"));
+        assert_eq!(name("Invoice 3/2026").as_deref(), Some("Invoice 3-2026.eml"));
+        assert_eq!(name("a\\b").as_deref(), Some("a-b.eml"));
+        assert_eq!(name("../../.bashrc").as_deref(), Some("-..-.bashrc.eml"));
+        assert_eq!(name("").as_deref(), Some("message.eml"));
+        assert_eq!(name("...").as_deref(), Some("message.eml"));
+        let views = render(mail("Invoice 3/2026").as_bytes(), 1, false).attachments;
+        assert_eq!(views.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["Invoice 3-2026.eml"]);
     }
 
     #[test]
