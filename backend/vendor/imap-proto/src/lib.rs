@@ -1,11 +1,13 @@
 // The compatibility fix below is enforced for this crate's own macros.
 #![deny(semicolon_in_expressions_from_macros)]
-// nom 5's external macros still use this syntax. Cargo normally caps their
-// diagnostics for registry crates; keep this exception limited to external macros.
-#![allow(semicolon_in_expressions_from_non_local_macros)]
 // Preserve upstream code and API while avoiding new stylistic warnings that
 // Cargo normally suppresses for registry dependencies.
 #![allow(dead_code, mismatched_lifetime_syntaxes)]
+#![allow(
+    clippy::redundant_closure,
+    clippy::single_component_path_imports,
+    clippy::match_like_matches_macro
+)]
 
 #[macro_use]
 extern crate nom;
