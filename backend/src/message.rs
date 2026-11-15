@@ -1,7 +1,7 @@
 use crate::images;
 use crate::mailbox::{Person, display_text, is_format_char, people};
 use crate::sanitize::{clean_html, text_to_html};
-use mail_parser::{Message, MessageParser, MessagePart, MimeHeaders, PartType};
+use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders, PartType};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -55,10 +55,12 @@ fn mime_of(part: &MessagePart) -> String {
         .unwrap_or_else(|| "application/octet-stream".into())
 }
 
-/// Bytes of an attachment part; a forwarded mail is returned whole.
+/// Bytes of an attachment part; a forwarded mail is returned whole. An
+/// unencoded one is cut from `raw` (mail-parser's copy of it is the whole
+/// outer mail); a base64 or quoted-printable one comes decoded.
 fn part_bytes<'a>(raw: &'a [u8], part: &'a MessagePart) -> &'a [u8] {
     match &part.body {
-        PartType::Message(_) => raw
+        PartType::Message(_) if part.encoding == Encoding::None => raw
             .get(part.offset_body as usize..part.offset_end as usize)
             .unwrap_or_default(),
         _ => part.contents(),
@@ -503,6 +505,31 @@ Content-Transfer-Encoding: base64\r\n\
         let view = render(mail, 1, false);
         let names: Vec<&str> = view.attachments.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["photo.jpg"]);
+    }
+
+    #[test]
+    fn attached_mail_is_saved_decoded() {
+        let inner = b"From: a@x.az\r\nSubject: inner\r\n\r\nhello\r\n";
+        let mail = |encoding: &str, body: &str| {
+            format!(
+                "Subject: fwd\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n\
+--b\r\nContent-Type: message/rfc822\r\n{encoding}\r\n{body}\r\n--b--\r\n"
+            )
+        };
+        let plain = mail("", "From: a@x.az\r\nSubject: inner\r\n\r\nhello\r\n");
+        let base64 = mail(
+            "Content-Transfer-Encoding: base64\r\n",
+            "RnJvbTogYUB4LmF6DQpTdWJqZWN0OiBpbm5lcg0KDQpoZWxsbw0K",
+        );
+        for raw in [plain, base64] {
+            let (name, bytes) = attachment(raw.as_bytes(), 0).unwrap();
+            assert_eq!(name, "inner.eml");
+            assert_eq!(String::from_utf8_lossy(&bytes).trim_end(), String::from_utf8_lossy(inner).trim_end());
+            assert_eq!(render(raw.as_bytes(), 1, false).attachments[0].size, bytes.len());
+            let forwarded = all_attachments(raw.as_bytes());
+            assert_eq!(forwarded[0].2, bytes);
+        }
     }
 
     #[test]
