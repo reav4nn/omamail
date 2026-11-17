@@ -134,7 +134,33 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)
+    let written = file
+        .write_all(data)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&tmp, path));
+    // A failed write (disk full) must not leave a copy of a code or a
+    // subject behind under a name that sign-out never removes.
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_private_write_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("omamail-private-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // A non-empty directory in the way makes the final rename fail.
+        let path = dir.join("watch.json");
+        fs::create_dir_all(path.join("busy")).unwrap();
+        assert!(write_private(&path, b"{\"code\":\"482913\"}").is_err());
+        let names: Vec<String> =
+            fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(names, ["watch.json"]);
+    }
 }
