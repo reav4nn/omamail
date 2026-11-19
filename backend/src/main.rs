@@ -11,6 +11,8 @@ mod sanitize;
 mod secret;
 mod send;
 mod server;
+#[cfg(test)]
+mod test_support;
 mod update;
 mod utf7;
 mod watch;

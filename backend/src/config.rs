@@ -134,7 +134,48 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)
+    let written = file.write_all(data).and_then(|()| file.sync_all());
+    drop(file);
+    let written = written.and_then(|()| fs::rename(&tmp, path));
+    // A failed write or rename must not leave private data in a file that
+    // sign-out never removes. Preserve the original error if cleanup fails.
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_failed_private_write_preserves_the_target_and_leaves_no_temp_file() {
+        let dir = TempDir::new();
+        let path = dir.path().join("watch.json");
+        fs::create_dir(&path).unwrap();
+        let previous = path.join("previous");
+        fs::write(&previous, b"previous contents").unwrap();
+
+        // Renaming a file over a non-empty directory fails after data is written.
+        let err = write_private(&path, b"synthetic private data").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
+        assert_eq!(fs::read(&previous).unwrap(), b"previous contents");
+        let names: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names, ["watch.json"]);
+    }
+
+    #[test]
+    fn a_successful_private_write_replaces_the_target_with_private_permissions() {
+        let dir = TempDir::new();
+        let path = dir.path().join("watch.json");
+        fs::write(&path, b"old").unwrap();
+        write_private(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

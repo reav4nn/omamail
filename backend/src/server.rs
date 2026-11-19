@@ -825,6 +825,58 @@ mod tests {
     }
 
     #[test]
+    fn attached_mail_has_matching_displayed_size_download_and_forward_bytes() {
+        use crate::test_support::{TempDir, attached_mail};
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let dir = TempDir::new();
+        let inner = "From: sender@example.test\r\nSubject: Invoice 3/2026\r\n\r\nA = B\r\n";
+        let base64 = STANDARD.encode(inner);
+        let quoted_printable = inner.replace('=', "=3D");
+        for (headers, body) in [
+            ("", inner),
+            ("Content-Transfer-Encoding: base64\r\n", base64.as_str()),
+            ("Content-Transfer-Encoding: quoted-printable\r\n", quoted_printable.as_str()),
+        ] {
+            let mail = attached_mail(headers, body);
+            let raw = mail.as_bytes();
+            let view = message::render(raw, 1, false);
+            assert_eq!(view.attachments.len(), 1);
+            let shown = &view.attachments[0];
+            assert_eq!(shown.name, "Invoice 3-2026.eml");
+            assert_eq!(shown.size, inner.len());
+            let (name, bytes) = message::attachment(raw, shown.index).unwrap();
+            assert_eq!(name, shown.name);
+            let path = write_unique(dir.path(), &name, &bytes).unwrap();
+            assert_eq!(path.extension().unwrap(), "eml");
+            assert!(!safe_to_open(&path));
+            assert_eq!(std::fs::read(path).unwrap(), inner.as_bytes());
+            assert_eq!(message::draft(raw, "forward", "").unwrap().attachments, std::slice::from_ref(&name));
+            assert_eq!(
+                message::all_attachments(raw),
+                [(name, "message/rfc822".to_string(), inner.as_bytes().to_vec())],
+            );
+        }
+    }
+
+    #[test]
+    fn long_subject_download_fits_the_filesystem_without_losing_eml() {
+        use crate::test_support::{TempDir, attached_mail};
+
+        let dir = TempDir::new();
+        let inner = format!("From: sender@example.test\r\nSubject: {}\r\n\r\nBody", "報".repeat(200));
+        let mail = attached_mail("", &inner);
+        let (name, bytes) = message::attachment(mail.as_bytes(), 0).unwrap();
+        for _ in 0..2 {
+            let path = write_unique(dir.path(), &name, &bytes).unwrap();
+            assert_eq!(path.extension().unwrap(), "eml");
+            assert!(path.file_name().unwrap().len() <= NAME_MAX);
+            assert_eq!(std::fs::read(path).unwrap(), inner.as_bytes());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
     fn long_names_fit_in_255_bytes() {
         // 180 characters pass safe_filename but are 540 bytes in CJK.
         let dir = std::env::temp_dir().join(format!("omamail-long-{}", std::process::id()));
