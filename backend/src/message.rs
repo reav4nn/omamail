@@ -1,7 +1,7 @@
 use crate::images;
 use crate::mailbox::{Person, display_text, is_format_char, people};
 use crate::sanitize::{clean_html, text_to_html};
-use mail_parser::{Message, MessageParser, MessagePart, MimeHeaders, PartType};
+use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders, PartType};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -55,12 +55,15 @@ fn mime_of(part: &MessagePart) -> String {
         .unwrap_or_else(|| "application/octet-stream".into())
 }
 
-/// Bytes of an attachment part; a forwarded mail is returned whole.
+/// Bytes of an attachment part; a forwarded mail is returned whole. For
+/// unencoded mail the parser points into the outer message, while for
+/// Base64 and quoted-printable it retains the decoded message bytes.
 fn part_bytes<'a>(raw: &'a [u8], part: &'a MessagePart) -> &'a [u8] {
     match &part.body {
-        PartType::Message(_) => raw
+        PartType::Message(_) if part.encoding == Encoding::None => raw
             .get(part.offset_body as usize..part.offset_end as usize)
             .unwrap_or_default(),
+        PartType::Message(message) => message.raw_message.as_ref(),
         _ => part.contents(),
     }
 }
@@ -70,8 +73,8 @@ fn part_bytes<'a>(raw: &'a [u8], part: &'a MessagePart) -> &'a [u8] {
 /// download folder or disguise its extension.
 pub fn safe_filename(name: &str, fallback: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let cleaned: String = base.chars().filter(|c| !c.is_control() && !is_format_char(*c)).collect();
-    let cleaned = cleaned.trim_start_matches(|c: char| c == '.' || c.is_whitespace()).trim_end();
+    let cleaned = filename_text(base);
+    let cleaned = trim_filename(&cleaned);
     if cleaned.is_empty() {
         return fallback.to_string();
     }
@@ -94,15 +97,34 @@ pub fn safe_filename(name: &str, fallback: &str) -> String {
 
 const MAX_NAME_CHARS: usize = 180;
 
+fn filename_text(name: &str) -> String {
+    name.chars().filter(|c| !c.is_control() && !is_format_char(*c)).collect()
+}
+
+fn trim_filename(name: &str) -> &str {
+    name.trim_start_matches(|c: char| c == '.' || c.is_whitespace()).trim_end()
+}
+
 fn attachment_name(part: &MessagePart, index: usize, mime: &str) -> String {
-    let fallback = match &part.body {
-        PartType::Message(m) => format!("{}.eml", m.subject().unwrap_or("message")),
-        _ => {
-            let ext = mime_guess::get_mime_extensions_str(mime).and_then(|e| e.first().copied()).unwrap_or("bin");
-            format!("attachment-{}.{ext}", index + 1)
+    let is_mail = matches!(part.body, PartType::Message(_)) || mime == "message/rfc822";
+    if let Some(name) = part.attachment_name().filter(|name| !is_mail || !name.trim().is_empty()) {
+        return safe_filename(name, &format!("attachment-{}", index + 1));
+    }
+    if is_mail {
+        // A subject is not a path: "Invoice 3/2026" must not be cut to "2026".
+        let subject = match &part.body {
+            PartType::Message(m) => m.subject().unwrap_or_default(),
+            _ => "",
+        };
+        let subject = filename_text(&subject.replace(['/', '\\'], "-"));
+        let subject = trim_filename(&subject);
+        if subject.is_empty() {
+            return "message.eml".to_string();
         }
-    };
-    safe_filename(part.attachment_name().unwrap_or(&fallback), &format!("attachment-{}", index + 1))
+        return safe_filename(&format!("{subject}.eml"), "message.eml");
+    }
+    let ext = mime_guess::get_mime_extensions_str(mime).and_then(|e| e.first().copied()).unwrap_or("bin");
+    format!("attachment-{}.{ext}", index + 1)
 }
 
 fn content_id(part: &MessagePart) -> Option<String> {
@@ -450,6 +472,40 @@ To: me@gmail.com, <b@x.az,evil@e.az>, Leyla <leyla@x.az>\r\nCc: R <r@x.az evil@e
         assert_eq!(d.subject, "Fwd: Görüş");
         assert!(d.to.is_empty() && d.in_reply_to.is_empty());
         assert_eq!(d.attachments, vec!["bashrc"]);
+    }
+
+    #[test]
+    fn unnamed_attached_mail_uses_a_safe_subject_and_keeps_the_eml_extension() {
+        use crate::test_support::attached_mail;
+
+        let long_subject = "報".repeat(200);
+        let truncated = format!("{}.eml", "報".repeat(176));
+        for (subject, expected) in [
+            ("Report", "Report.eml"),
+            ("Invoice 3/2026", "Invoice 3-2026.eml"),
+            ("a\\b", "a-b.eml"),
+            ("../../.draft", "-..-.draft.eml"),
+            ("", "message.eml"),
+            (" . . ", "message.eml"),
+            (long_subject.as_str(), truncated.as_str()),
+        ] {
+            let inner = format!("From: sender@example.test\r\nSubject: {subject}\r\n\r\nBody");
+            let mail = attached_mail("", &inner);
+            let raw = mail.as_bytes();
+            assert_eq!(render(raw, 1, false).attachments[0].name, expected);
+            assert_eq!(attachment(raw, 0).unwrap().0, expected);
+        }
+    }
+
+    #[test]
+    fn named_attached_mail_still_uses_the_sanitized_explicit_filename() {
+        use crate::test_support::attached_mail;
+
+        let inner = "From: sender@example.test\r\nSubject: Invoice 3/2026\r\n\r\nBody";
+        let named = attached_mail("Content-Disposition: attachment; filename=\"../.report.txt\"\r\n", inner);
+        assert_eq!(attachment(named.as_bytes(), 0).unwrap().0, "report.txt");
+        let unnamed = attached_mail("Content-Disposition: attachment; filename=\"\"\r\n", inner);
+        assert_eq!(attachment(unnamed.as_bytes(), 0).unwrap().0, "Invoice 3-2026.eml");
     }
 
     #[test]

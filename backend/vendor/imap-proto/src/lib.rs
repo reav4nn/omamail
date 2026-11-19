@@ -6,6 +6,11 @@
 // Preserve upstream code and API while avoiding new stylistic warnings that
 // Cargo normally suppresses for registry dependencies.
 #![allow(dead_code, mismatched_lifetime_syntaxes)]
+#![allow(
+    clippy::redundant_closure,
+    clippy::single_component_path_imports,
+    clippy::match_like_matches_macro
+)]
 
 #[macro_use]
 extern crate nom;
