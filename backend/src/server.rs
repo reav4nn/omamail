@@ -1,18 +1,22 @@
 //! `omamail serve`: the backend the QML window talks to.
 //!
 //! Protocol: one JSON object per line on stdin/stdout.
-//!   request  {"id": 1, "cmd": "list", "folder": "INBOX", "before_uid": 0}
-//!   request  {"id": 2, "cmd": "cached", "folder": "INBOX"}
+//!   request  {"id": 1, "cmd": "status"} returns the session token
+//!   request  {"id": 2, "cmd": "list", "session": "...", "folder": "INBOX", "before_uid": 0}
 //!   reply    {"id": 1, "ok": true, "data": ...} | {"id": 1, "ok": false, "code": "auth", "error": "..."}
-//!   event    {"event": "changed", "folder": "INBOX"}
+//!   event    {"event": "changed", "folder": "INBOX", "session": token}
 //! Requests run one at a time on a worker thread that owns the IMAP
 //! connection; a second connection sits in IDLE on INBOX to push changes.
 
+mod account_commands;
+#[cfg(feature = "demo")]
+mod demo_commands;
+
+use crate::accounts::{self, Accounts};
 use crate::config::{self, Account};
 use crate::liveness;
 use crate::mailbox::{MailError, Mailbox};
 use crate::message;
-use crate::secret;
 use crate::send::{self, Outgoing};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -69,6 +73,8 @@ fn fail(message: impl Into<String>) -> Failure {
     }
 }
 
+fn fail_io(e: std::io::Error) -> Failure { fail(format!("Could not access account settings or state: {e}")) }
+
 type Reply = Result<Value, Failure>;
 
 fn str_arg<'a>(req: &'a Value, key: &str) -> Result<&'a str, Failure> {
@@ -119,12 +125,18 @@ struct Session {
     account: Account,
     password: String,
     mailbox: Mailbox,
-    idle_stop: Arc<AtomicBool>,
+    idle_stop: Arc<liveness::SocketCancel>,
 }
 
 struct Server {
     out: Out,
     session: Option<Session>,
+    accounts: Accounts,
+    boot: String,
+    epoch: u64,
+    sending: Arc<AtomicBool>,
+    images: Vec<(String, std::thread::JoinHandle<()>)>,
+    credential_error: String,
     /// Body cache keyed by folder, UID, and the UIDVALIDITY it was fetched
     /// under. A rebuilt mailbox reuses UIDs, so a hit under another
     /// generation would show the wrong message.
@@ -148,12 +160,13 @@ struct Undo {
 
 impl Server {
     fn start_session(&mut self, account: Account, password: String) {
-        let idle_stop = Arc::new(AtomicBool::new(false));
+        let idle_stop = Arc::new(liveness::SocketCancel::default());
         spawn_idle(
             account.clone(),
             password.clone(),
             self.out.clone(),
             Arc::clone(&idle_stop),
+            self.token(),
         );
         self.session = Some(Session {
             mailbox: Mailbox::new(account.clone(), password.clone()),
@@ -165,7 +178,7 @@ impl Server {
 
     fn end_session(&mut self) {
         if let Some(mut s) = self.session.take() {
-            s.idle_stop.store(true, Ordering::Relaxed);
+            s.idle_stop.stop();
             s.mailbox.close();
         }
         self.raw_cache.clear();
@@ -246,11 +259,18 @@ impl Server {
 
     /// None when the reply is sent later by another thread (see `send`).
     fn handle(&mut self, req: &Value) -> Option<Reply> {
-        #[cfg(feature = "demo")]
-        if let Some(reply) = crate::demo::dispatch(req) {
-            return Some(reply.map_err(fail));
-        }
         let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or_default();
+        if cmd == "status" { return Some(Ok(self.status())); }
+        if req["session"].as_str() != Some(&self.token()) {
+            return Some(Err(fail("This account session has ended")));
+        }
+        if matches!(cmd, "login" | "select" | "remove" | "send") && self.sending.load(Ordering::Acquire) {
+            return Some(Err(fail("Wait for the current message to finish sending")));
+        }
+        if cfg!(feature = "demo") {
+            #[cfg(feature = "demo")]
+            return Some(self.demo(req, cmd));
+        }
         if cmd == "send" {
             return self.send(req);
         }
@@ -262,24 +282,7 @@ impl Server {
 
     fn dispatch(&mut self, cmd: &str, req: &Value) -> Reply {
         match cmd {
-            "status" => Ok(match &self.session {
-                Some(s) => {
-                    json!({"configured": true, "email": s.account.email, "version": VERSION})
-                }
-                None => {
-                    json!({"configured": false, "email": config::load_account().map(|a| a.email), "version": VERSION})
-                }
-            }),
-            "login" => self.login(req),
-            "logout" => {
-                watcher("stop");
-                if let Some(s) = &self.session {
-                    secret::clear(&s.account.email);
-                }
-                self.end_session();
-                config::remove_account();
-                Ok(Value::Null)
-            }
+            "login" | "select" | "remove" => self.change_account(cmd, req),
             "folders" => self
                 .session()
                 .and_then(|s| Ok(json!(s.mailbox.folders(true)?))),
@@ -298,14 +301,14 @@ impl Server {
                 // them would replace the newest headers the window opens on.
                 if before == 0 {
                     let email = self.session()?.account.email.clone();
-                    crate::listcache::store(&email, &folder, &page);
+                    crate::listcache::store(self.active_id(), &email, &folder, &page);
                 }
                 Ok(json!(page))
             }
             "cached" => {
                 let folder = str_arg(req, "folder")?.to_string();
                 let email = self.session()?.account.email.clone();
-                Ok(json!(crate::listcache::load(&email, &folder)))
+                Ok(json!(crate::listcache::load(self.active_id(), &email, &folder)))
             }
             "search" => {
                 let folder = str_arg(req, "folder")?.to_string();
@@ -321,7 +324,7 @@ impl Server {
                 let raw = self.raw(&folder, uid, mark, validity)?;
                 let observed = self.generation(&folder, validity);
                 Ok(stamp_validity(
-                    json!(message::render(&raw, uid, false)),
+                    json!(message::render_for(&raw, uid, false, Some(self.active_id()))),
                     observed,
                 ))
             }
@@ -352,32 +355,6 @@ impl Server {
             }
             other => Err(fail(format!("unknown command {other}"))),
         }
-    }
-
-    fn login(&mut self, req: &Value) -> Reply {
-        let email = str_arg(req, "email")?.trim().to_string();
-        let password: String = str_arg(req, "password")?
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        if !email.contains('@') || email.contains(char::is_whitespace) {
-            return Err(fail("Enter your full Gmail address"));
-        }
-        if password.is_empty() {
-            return Err(fail("Enter the app password"));
-        }
-        let account = Account::gmail(&email);
-        let mut probe = Mailbox::new(account.clone(), password.clone());
-        probe.connect()?;
-        probe.close();
-        secret::store(&email, &password).map_err(fail)?;
-        config::save_account(&account)
-            .map_err(|e| fail(format!("Could not save settings: {e}")))?;
-        crate::listcache::retain(&email);
-        self.end_session();
-        self.start_session(account, password);
-        watcher("restart");
-        Ok(json!({"email": email}))
     }
 
     fn move_messages(&mut self, req: &Value) -> Reply {
@@ -509,10 +486,12 @@ impl Server {
         };
         let observed = self.generation(&folder, validity);
         let out = self.out.clone();
-        std::thread::spawn(move || {
-            let view = stamp_validity(json!(message::render(&raw, uid, true)), observed);
+        let owner = self.active_id().to_owned();
+        self.images.retain(|(_, j)| !j.is_finished());
+        self.images.push((owner.clone(), std::thread::spawn(move || {
+            let view = stamp_validity(json!(message::render_for(&raw, uid, true, Some(&owner))), observed);
             out.emit(&json!({"id": id, "ok": true, "data": view}));
-        });
+        })));
         None
     }
 
@@ -542,11 +521,14 @@ impl Server {
             Err(e) => return Some(Err(e)),
         };
         let out = self.out.clone();
+        let sending = self.sending.clone();
+        sending.store(true, Ordering::Release);
         std::thread::spawn(move || {
             let reply = match send::send(&account, &password, &outgoing, forwarded) {
                 Ok(()) => json!({"id": id, "ok": true, "data": null}),
                 Err(e) => json!({"id": id, "ok": false, "code": "error", "error": e}),
             };
+            sending.store(false, Ordering::Release);
             out.emit(&reply);
         });
         None
@@ -677,19 +659,18 @@ fn fit_name(stem: &str, suffix: &str, ext: &str) -> String {
 /// look: mail that arrived while not in IDLE, at startup or across a
 /// reconnect, is caught that way. The first round only records the counts:
 /// the window loads its own list when it opens.
-fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool>) {
+fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<liveness::SocketCancel>, token: String) {
     std::thread::spawn(move || {
-        let mut mailbox = Mailbox::new(account, password);
+        let mut mailbox = Mailbox::new(account, password).with_cancel(Arc::clone(&stop));
         let mut backoff = liveness::Backoff::new(120);
         let mut seen: Option<(u32, u32)> = None;
         let mut woke = false;
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.stopped() {
             let kicks = liveness::kicks();
             let started = Instant::now();
             let result = mailbox.counts("INBOX").and_then(|now| {
-                if (woke || (seen.is_some() && seen != Some(now))) && !stop.load(Ordering::Relaxed)
-                {
-                    out.emit(&json!({"event": "changed", "folder": "INBOX"}));
+                if (woke || (seen.is_some() && seen != Some(now))) && !stop.stopped() {
+                    out.emit(&json!({"event": "changed", "folder": "INBOX", "session": token}));
                 }
                 seen = Some(now);
                 mailbox.idle(IDLE_TIMEOUT)
@@ -698,7 +679,7 @@ fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool
                 Ok(changed) => {
                     woke = changed;
                     if let Some(wait) = backoff.after_round(started.elapsed()) {
-                        liveness::sleep(wait, kicks);
+                        stop.sleep(wait, kicks);
                     }
                 }
                 // The worker's requests report a rejected login to the window,
@@ -707,7 +688,7 @@ fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool
                 Err(e) => {
                     // Changes may have been missed while disconnected.
                     woke = true;
-                    if liveness::sleep(backoff.next(e.is_offline()), kicks) {
+                    if stop.sleep(backoff.next(e.is_offline()), kicks) {
                         backoff.reset();
                     }
                 }
@@ -718,24 +699,31 @@ fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool
 }
 
 pub fn run() {
-    liveness::start();
+    if !cfg!(feature="demo") { liveness::start(); }
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
     let (tx, rx) = mpsc::channel::<Value>();
     let worker_out = out.clone();
     std::thread::spawn(move || {
-        let mut server = Server {
-            out: worker_out.clone(),
-            session: None,
-            raw_cache: VecDeque::new(),
-            undo: None,
-            undo_seq: 0,
+        let boot = accounts::nonce();
+        let init = boot.and_then(|boot| {
+            let (panel, accounts) = if cfg!(feature="demo") {
+                (None, Accounts::default())
+            } else {
+                let panel = accounts::panel_lock()?;
+                let _lock = accounts::lock()?;
+                (Some(panel), Accounts::load()?)
+            };
+            Ok((panel, Server { out: worker_out.clone(), session: None, accounts, boot, epoch: 0,
+                credential_error: String::new(), sending: Arc::default(), images: vec![],
+                raw_cache: VecDeque::new(), undo: None, undo_seq: 0 }))
+        });
+        let (_panel, mut server) = match init {
+            Ok(s) => s,
+            Err(e) => { for req in rx { worker_out.emit(&json!({"id":req["id"],"ok":false,"error":format!("Could not open accounts: {e}")})); } return; }
         };
-        // The demo build answers from fixtures: no account, no connection.
-        if let Some(account) = config::load_account().filter(|_| !cfg!(feature = "demo"))
-            && let Some(password) = secret::lookup(&account.email)
-        {
-            server.start_session(account, password);
-        }
+        if !cfg!(feature="demo") { server.restore(); }
+        #[cfg(feature="demo")]
+        server.init_demo();
         for req in rx {
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             let Some(reply) = server.handle(&req) else {

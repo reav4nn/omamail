@@ -11,20 +11,25 @@ Item {
   property bool started: false
   property int nextId: 1
   property var callbacks: ({})
-  property var queue: []
+  property string session: ""
+  signal ready()
 
   signal changed(string folder)
   signal failed(string message)
 
   function request(cmd, args, callback) {
+    if (!started || (cmd !== "status" && !session)) {
+      if (callback) callback(false, "The mail backend is not ready", "error")
+      return -1
+    }
     var msg = {}
     for (var k in (args || {})) msg[k] = args[k]
     msg.id = nextId++
     msg.cmd = cmd
-    if (callback) callbacks[msg.id] = callback
+    msg.session = session
+    if (callback) callbacks[msg.id] = { session: session, call: callback }
     var line = JSON.stringify(msg) + "\n"
-    if (started) proc.write(line)
-    else queue.push(line)
+    proc.write(line)
     return msg.id
   }
 
@@ -37,21 +42,14 @@ Item {
       return
     }
     if (msg.event === "changed") {
-      root.changed(msg.folder || "INBOX")
+      if (root.session && msg.session === root.session) root.changed(msg.folder || "INBOX")
       return
     }
     var cb = callbacks[msg.id]
     if (!cb) return
     delete callbacks[msg.id]
-    cb(msg.ok === true, msg.ok ? msg.data : (msg.error || "Unknown error"), msg.code || "")
-  }
-
-  function failAll(message) {
-    var pending = callbacks
-    callbacks = ({})
-    for (var id in pending) {
-      try { pending[id](false, message, "error") } catch (e) {}
-    }
+    if (cb.session !== root.session) return
+    cb.call(msg.ok === true, msg.ok ? msg.data : (msg.error || "Unknown error"), msg.code || "")
   }
 
   Process {
@@ -69,14 +67,13 @@ Item {
 
     onStarted: {
       root.started = true
-      var pending = root.queue
-      root.queue = []
-      for (var i = 0; i < pending.length; i++) proc.write(pending[i])
+      root.ready()
     }
 
     onExited: function(code, status) {
       root.started = false
-      root.failAll("The mail backend stopped (exit " + code + ")")
+      root.callbacks = ({})
+      root.session = ""
       root.failed("The mail backend stopped unexpectedly. Restarting…")
       restartTimer.restart()
     }

@@ -9,7 +9,7 @@
 
 **A light, keyboard-driven Gmail client for the Omarchy shell.**
 
-[![Version](https://img.shields.io/badge/version-1.2.10-blue)](manifest.json)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue)](manifest.json)
 [![Platform](https://img.shields.io/badge/platform-Omarchy-1793d1)](https://omarchy.org)
 [![Backend](https://img.shields.io/badge/backend-Rust-b7410e)](backend)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
@@ -47,21 +47,21 @@ and uses about 7 MB of memory.
 
 - **Part of the shell.** Built from `omarchy-shell`'s own components and theme
   tokens, so colours, font and rounding change with the theme.
-- **Notifications.** A user service waits on the inbox with IMAP IDLE and
-  posts one notification per new message; clicking it opens the message.
+- **Notifications.** A user service watches each saved inbox independently with IMAP IDLE and
+  posts notifications labelled with the receiving account. Clicking a message selects that account and opens the message.
   After a suspend or a Wi-Fi or VPN change it reconnects within seconds.
   Gmail itself usually announces new mail over IMAP 10–50 seconds after it
   arrives, for any client.
 - **Verification codes.** When a new mail carries a one-time code, the
-  notification shows it and a click copies it. The copy is marked
+  notification shows it and a click copies only that account’s code. Clicks for removed accounts or an unknown mailbox generation do nothing. The copy is marked
   sensitive and stays out of clipboard history.
 - **Keyboard first.** Move with `j`/`k`, search with `/`, compose with `c`.
   See [Usage](#usage).
 - **Opens on the last list.** The newest 200 headers of each folder you
-  open are kept in `~/.local/state/omamail/list.json` (readable only by
+  open are kept in `~/.local/state/omamail/accounts/<id>/list.json` (readable only by
   you), so the list is there when the window opens and settles when Gmail
   replies. Starring or moving a saved row waits until that reply confirms
-  the mailbox. Signing out deletes the file.
+  the mailbox. Removing an account deletes its file.
 - **Light.** A ~3 MB Rust backend using about 7 MB of RAM. Closing the
   window ends it; only the notification service keeps running.
 - **Careful with mail.** HTML is sanitized, remote images load only when
@@ -74,7 +74,7 @@ and uses about 7 MB of memory.
 |---|---|
 | **Desktop** | [Omarchy](https://omarchy.org) with `omarchy-shell`. The panel is built from the shell's components, so other desktops need a port. |
 | **Account** | A Gmail account with 2-Step Verification and an [app password](https://myaccount.google.com/apppasswords). |
-| **Build** | Rust and Cargo, available through Omarchy’s development tools. |
+| **Build** | Rust 1.89 or newer with Cargo, available through Omarchy’s development tools. |
 | **Attachments** | zenity, for the attachment file picker. |
 
 Install these prerequisites before running `install.sh`.
@@ -95,6 +95,19 @@ notification service.
 Omamail signs in with a Gmail **app password**. Turn on 2-Step
 Verification, then create one at <https://myaccount.google.com/apppasswords>.
 The password is kept in the desktop keyring, never in a file.
+
+Click the address in the sidebar to **add**, **switch**, **sign in again** or
+**remove** an account. The last selection is restored when Omamail opens.
+Choose *Saved accounts* on the sign-in screen if one password is missing or
+rejected. Adding an address again (regardless of case) updates that account.
+An existing single-account installation keeps its server settings and keyring entry.
+
+![Gmail account picker in the Tokyo Night theme, showing two demo accounts](docs/images/accounts.png)
+
+Every composer shows **From**. Switching starts at the new inbox, with no
+previous search, open message or undo. If there is a draft, Omamail asks
+before discarding it. During a send, account changes wait. Removing the last
+account returns to sign-in; it does not delete messages from Gmail.
 
 ## Usage
 
@@ -174,8 +187,10 @@ How mail is handled:
   not run.
 - **Verification codes** stay out of clipboard history, but do appear in
   Omarchy's notification history.
-- **Signing out** removes the password, the account settings, the service
-  state and the saved headers. Cached images stay until you remove them.
+- **Removing an account** deletes its password, settings, cached headers and
+  images, watcher position and saved codes. Downloads stay in your Downloads
+  folder. Pre-upgrade files without verifiable ownership (including the old
+  shared image cache) are never reused; uninstall removes those files.
 
 ## Uninstall
 
@@ -210,8 +225,23 @@ cd backend && cargo test --locked && cd ..
 omarchy restart shell
 ```
 
-The backend speaks one JSON object per line on stdio, for example
-`{"id":1,"cmd":"list","folder":"INBOX","before_uid":0}`; see
+For the offline multi-account checks, run these from the repository root:
+
+```bash
+(cd backend && cargo test --locked && cargo test --locked --features demo && cargo build --locked)
+node --test tests/account-panel.mjs
+python3 tests/loopback-imap.py backend/target/debug/omamail
+```
+
+The last check uses Python, OpenSSL and a temporary loopback TLS server.
+The QML controller tests do not render the desktop. On Omarchy, the `demo`
+build starts with two synthetic accounts; use `demo` as the app password to
+exercise adding another. It never signs in to Gmail or uses your keyring.
+
+The backend speaks one JSON object per line on stdio. Start with
+`{"id":1,"cmd":"status"}`, then include the returned `session` value on every
+account or mailbox command. Obtain the new token after a successful change;
+commands from an earlier session or backend process are rejected. See
 `backend/src/server.rs`. The rules every change follows are in
 [AGENTS.md](AGENTS.md); how to report a bug or send a change is in
 [CONTRIBUTING.md](CONTRIBUTING.md).

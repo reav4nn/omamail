@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 type Session = imap::Session<Stream>;
@@ -395,6 +396,7 @@ pub struct Mailbox {
     /// The connection's socket, registered so a resume or network change can
     /// cut a blocked read short (see liveness.rs).
     tracked: Option<liveness::Tracked>,
+    cancel: Option<Arc<liveness::SocketCancel>>,
     /// The address that worked last time, tried first: where IPv6 is
     /// configured but goes nowhere, every reconnect would wait for it.
     preferred: Option<SocketAddr>,
@@ -426,14 +428,28 @@ impl Mailbox {
             arrived: false,
             idle_start_failures: 0,
             tracked: None,
+            cancel: None,
             preferred: None,
             tls: None,
             capabilities_known: false,
         }
     }
 
+    pub fn with_cancel(mut self, cancel: Arc<liveness::SocketCancel>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn check_cancel(&self) -> MailResult<()> {
+        if let Some(cancel) = &self.cancel {
+            cancel.check().map_err(|e| MailError::Offline(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub fn connect(&mut self) -> MailResult<()> {
         self.close();
+        self.check_cancel()?;
         let host = self.account.imap_host.clone();
         let mut addrs: Vec<SocketAddr> = (host.as_str(), self.account.imap_port)
             .to_socket_addrs()
@@ -452,6 +468,7 @@ impl Mailbox {
         let mut last = MailError::Offline(format!("{host}: no address"));
         let mut tcp = None;
         for addr in &addrs {
+            self.check_cancel()?;
             match TcpStream::connect_timeout(addr, Duration::from_secs(10)) {
                 Ok(t) => {
                     self.preferred = Some(*addr);
@@ -465,7 +482,13 @@ impl Mailbox {
         tcp.set_read_timeout(Some(NETWORK_TIMEOUT)).ok();
         tcp.set_write_timeout(Some(NETWORK_TIMEOUT)).ok();
         liveness::keep_alive(&tcp);
-        self.tracked = liveness::Tracked::new(&tcp);
+        let tracked = liveness::Tracked::new(&tcp);
+        if let Some(cancel) = &self.cancel {
+            let socket = tracked.as_ref()
+                .ok_or_else(|| MailError::Offline("Could not track IDLE socket".into()))?;
+            cancel.track(socket).map_err(|e| MailError::Offline(e.to_string()))?;
+        }
+        self.tracked = tracked;
         match self.open_session(&host, tcp) {
             Ok(session) => {
                 self.session = Some(session);

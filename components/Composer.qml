@@ -106,6 +106,16 @@ Item {
       font.bold: true
     }
 
+    Text {
+      width: parent.width
+      elide: Text.ElideMiddle
+      textFormat: Text.PlainText
+      text: "From: " + root.draft.from
+      color: Color.foreground
+      font.family: Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+
     Row {
       width: parent.width
       spacing: Style.space(6)

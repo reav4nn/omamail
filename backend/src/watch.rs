@@ -11,7 +11,8 @@
 //! watcher state file and piped into `wl-copy`, so senders, subjects and
 //! codes never appear in `/proc/<pid>/cmdline`.
 
-use crate::config::{self, state_dir};
+use crate::accounts::{self, Accounts, Entry};
+use crate::config;
 use crate::liveness;
 use crate::mailbox::{MailError, Mailbox, Summary};
 use crate::message;
@@ -40,6 +41,8 @@ struct SavedCode {
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
+    #[serde(skip)]
+    account: String,
     /// The account the UIDs belong to; a different account starts fresh.
     #[serde(default)]
     email: String,
@@ -77,17 +80,21 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn state_file() -> PathBuf {
-    state_dir().join("watch.json")
-}
-
-fn load_state() -> State {
-    std::fs::read_to_string(state_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+fn load_state(entry: &Entry) -> State {
+    let mut state: State = std::fs::read(accounts::state(&entry.id).join("watch.json")).ok()
+        .and_then(|bytes| serde_json::from_slice::<State>(&bytes).ok())
+        .filter(|s| s.email == entry.account.email).unwrap_or_default();
+    state.account = entry.id.clone();
+    state
 }
 
 fn save_state(state: &State) {
-    if let Ok(text) = serde_json::to_string(state) {
-        let _ = config::write_private(&state_file(), text.as_bytes());
+    // Removal takes this same lock. A watcher still finishing an IMAP round
+    // must not recreate private state after the account is forgotten.
+    let Ok(_lock) = accounts::lock() else { return };
+    if Accounts::load().is_ok_and(|a| a.by_id(&state.account).is_some())
+        && let Ok(bytes) = serde_json::to_vec(state) {
+        let _ = config::write_private(&accounts::state(&state.account).join("watch.json"), &bytes);
     }
 }
 
@@ -111,12 +118,13 @@ fn omamail_bin() -> String {
         .unwrap_or_else(|| config::home().join(".local/lib/omamail/omamail").to_string_lossy().into_owned())
 }
 
-fn notify(summary: String, body: String, open_uid: Option<u32>) {
-    let payload = match open_uid {
-        Some(uid) => format!(r#"{{"folder":"{INBOX}","uid":{uid}}}"#),
-        None => format!(r#"{{"folder":"{INBOX}"}}"#),
-    };
-    let argv = serde_json::json!(["omarchy-shell", "shell", "summon", PLUGIN_ID, payload]).to_string();
+fn action_argv(cmd: &str, state: &State, uid: u32) -> String {
+    serde_json::json!([omamail_bin(), cmd, state.account, state.uidvalidity.to_string(), uid.to_string()]).to_string()
+}
+
+fn notify(state: &State, summary: String, body: String, open_uid: Option<u32>) {
+    let argv = action_argv("open", state, open_uid.unwrap_or(0));
+    let body = format!("{}\n{}", markup_escape(&state.email), body);
     let hints = vec![("omarchy-glyph".to_string(), GLYPH.to_string()), ("omarchy-exec-argv".to_string(), argv)];
     post(summary, body, hints);
 }
@@ -140,10 +148,10 @@ fn post(summary: String, body: String, hints: Vec<(String, String)>) {
 }
 
 /// A notification whose click copies `code` instead of opening the mail.
-/// `omarchy-exec-argv` only carries the message UID (`omamail copy <uid>`);
+/// `omarchy-exec-argv` carries only an account ID, UIDVALIDITY and UID;
 /// `copy` reads the code from the `0600` state file and pipes it to `wl-copy`.
-fn notify_code(sender: String, domain: &str, subject: &str, code: &str, uid: u32) {
-    let argv = serde_json::json!([omamail_bin(), "copy", uid.to_string()]).to_string();
+fn notify_code(state: &State, sender: String, domain: &str, subject: &str, code: &str, uid: u32) {
+    let argv = action_argv("copy", state, uid);
     // The display name is the sender's to choose ("Your Bank"); the domain
     // shows where the mail really came from.
     let body = format!(
@@ -153,23 +161,29 @@ fn notify_code(sender: String, domain: &str, subject: &str, code: &str, uid: u32
         markup_escape(subject)
     );
     let hints = vec![("omarchy-glyph".to_string(), GLYPH.to_string()), ("omarchy-exec-argv".to_string(), argv)];
-    post(sender, body, hints);
+    post(sender, format!("{}\n{}", markup_escape(&state.email), body), hints);
 }
 
-/// `omamail copy <uid>`: invoked by clicking a verification-code notification.
-/// Pipes the stored code to `wl-copy --sensitive` over stdin so the code never
-/// appears in process arguments, and avoids repeating it in the confirmation.
-pub fn copy(uid_arg: Option<&str>) -> i32 {
-    let Some(uid) = uid_arg.and_then(|s| s.parse::<u32>().ok()) else {
-        return 2;
-    };
-    let mut state = load_state();
-    let Some(code) = state.code_for(uid, now_secs()) else {
-        return 1;
-    };
-    if !pipe_to_wl_copy(&code) {
-        return 1;
+/// Account-less legacy actions cannot establish ownership. Never fall back
+/// to the current account, even if it is the only one remaining.
+pub fn click(cmd: &str, args: &[String]) -> i32 {
+    let [id, validity, uid] = args else { return 2 };
+    let (Ok(validity), Ok(uid)) = (validity.parse::<u32>(), uid.parse::<u32>()) else { return 2 };
+    let Ok(lock) = accounts::lock() else { return 1 };
+    let Ok(accounts) = Accounts::load() else { return 1 };
+    let Some(entry) = accounts.by_id(id) else { return 1 };
+    let mut state = load_state(entry);
+    if validity == 0 || state.uidvalidity != validity { return 1; }
+    if cmd == "open" {
+        let payload = serde_json::json!({"account":id,"folder":INBOX,"uid":uid,"uidvalidity":validity}).to_string();
+        // The panel revalidates membership. Don't hold its settings lock
+        // while synchronously waiting for the shell to open it.
+        drop(lock);
+        return if Command::new("omarchy-shell").args(["shell","summon",PLUGIN_ID,&payload]).status().is_ok_and(|s|s.success()) {0} else {1};
     }
+    let Some(code) = state.code_for(uid, now_secs()) else { return 1 };
+    if !pipe_to_wl_copy(&code) { return 1; }
+    drop(lock);
     let _ = send_notification("omarchy-action", "Code copied", "", &[], 2000);
     0
 }
@@ -451,14 +465,14 @@ fn domain_of(s: &Summary) -> String {
     s.from.first().and_then(|p| p.email.rsplit_once('@')).map(|(_, d)| d.to_string()).unwrap_or_default()
 }
 
-fn notify_plain(mail: &[&Summary]) {
+fn notify_plain(state: &State, mail: &[&Summary]) {
     match mail {
         [] => {}
-        [one] => notify(sender(one), markup_escape(&one.subject), Some(one.uid)),
+        [one] => notify(state, sender(one), markup_escape(&one.subject), Some(one.uid)),
         many => {
             let lines: Vec<String> =
                 many.iter().take(3).map(|s| markup_escape(&format!("{}: {}", sender(s), s.subject))).collect();
-            notify(format!("{} new messages", many.len()), lines.join("\n"), None);
+            notify(state, format!("{} new messages", many.len()), lines.join("\n"), None);
         }
     }
 }
@@ -475,7 +489,7 @@ fn notify_codes(state: &mut State, found: &[(&Summary, String)]) {
     }
     save_state(state);
     for (s, code) in found {
-        notify_code(sender(s), &domain_of(s), &s.subject, code, s.uid);
+        notify_code(state, sender(s), &domain_of(s), &s.subject, code, s.uid);
     }
 }
 
@@ -496,7 +510,7 @@ fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
         }
     }
     notify_codes(state, &with_code);
-    notify_plain(&plain);
+    notify_plain(state, &plain);
     if candidates.is_empty() {
         return;
     }
@@ -512,7 +526,7 @@ fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
         }
     }
     notify_codes(state, &found);
-    notify_plain(&without);
+    notify_plain(state, &without);
 }
 
 fn check(mailbox: &mut Mailbox, state: &mut State, email: &str) -> Result<(), MailError> {
@@ -547,7 +561,7 @@ fn check(mailbox: &mut Mailbox, state: &mut State, email: &str) -> Result<(), Ma
 /// The keyring may still be locked right after login: give it a while.
 fn keyring_password(email: &str) -> Option<String> {
     for attempt in 1..=KEYRING_TRIES {
-        if let Some(password) = secret::lookup(email) {
+        if let Ok(Some(password)) = secret::lookup(email) {
             return Some(password);
         }
         if attempt < KEYRING_TRIES {
@@ -558,18 +572,25 @@ fn keyring_password(email: &str) -> Option<String> {
 }
 
 pub fn run() -> i32 {
-    let Some(account) = config::load_account() else {
-        eprintln!("omamail watch: no account configured; sign in from the Omamail window first");
-        return 2;
+    let entries = match accounts::lock().and_then(|_lock| Accounts::load()) {
+        Ok(a) if !a.accounts.is_empty() => a.accounts,
+        Ok(_) => return 2,
+        Err(e) => { eprintln!("omamail watch: could not load accounts: {e}"); return 1; }
     };
+    liveness::start();
+    let workers: Vec<_> = entries.into_iter().map(|e| std::thread::spawn(move || watch_account(e))).collect();
+    workers.into_iter().map(|w| w.join().unwrap_or(1)).max().unwrap_or(2)
+}
+
+fn watch_account(entry: Entry) -> i32 {
+    let mut state = load_state(&entry);
+    let account = entry.account;
     let Some(password) = keyring_password(&account.email) else {
         eprintln!("omamail watch: no password in the keyring for {}", account.email);
         return 2;
     };
-    liveness::start();
     let email = account.email.clone();
     let mut mailbox = Mailbox::new(account.clone(), password);
-    let mut state = load_state();
     let mut backoff = liveness::Backoff::new(300);
     let mut logged_in = false;
     let mut auth_failures = 0;
@@ -600,7 +621,7 @@ pub fn run() -> i32 {
                 eprintln!("omamail watch: Gmail refused the login; retrying in {} min", wait.as_secs() / 60);
                 // Not cut short by network changes: refused logins must stay rare.
                 std::thread::sleep(wait);
-                if let Some(password) = secret::lookup(&email) {
+                if let Ok(Some(password)) = secret::lookup(&email) {
                     mailbox = Mailbox::new(account.clone(), password);
                 }
             }

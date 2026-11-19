@@ -1,3 +1,4 @@
+mod accounts;
 mod config;
 #[cfg(feature = "demo")]
 mod demo;
@@ -25,14 +26,14 @@ fn main() {
     }
     match std::env::args().nth(1).as_deref() {
         // The demo build (screenshots) must never act on the real account.
-        Some("watch" | "update-check" | "copy") if cfg!(feature = "demo") => {
+        Some("watch" | "update-check" | "copy" | "open") if cfg!(feature = "demo") => {
             eprintln!("omamail: the demo build only serves the window");
             std::process::exit(2);
         }
         Some("serve") => server::run(),
         Some("watch") => std::process::exit(watch::run()),
         Some("update-check") => std::process::exit(update::check()),
-        Some("copy") => std::process::exit(watch::copy(std::env::args().nth(2).as_deref())),
+        Some(cmd @ ("copy" | "open")) => std::process::exit(watch::click(cmd, &std::env::args().skip(2).collect::<Vec<_>>())),
         Some("--version") => println!("omamail {}", env!("CARGO_PKG_VERSION")),
         _ => {
             eprintln!(

@@ -76,6 +76,25 @@ pub fn send(
     out: &Outgoing,
     forwarded: Vec<(String, String, Vec<u8>)>,
 ) -> Result<(), String> {
+    let message = build_message(account, out, forwarded)?;
+    // Gmail stores a copy in Sent by itself, so nothing is appended over IMAP.
+    let transport = SmtpTransport::relay(&account.smtp_host)
+        .map_err(|e| e.to_string())?
+        .port(account.smtp_port)
+        .credentials(Credentials::new(account.email.clone(), password.to_string()))
+        .timeout(Some(Duration::from_secs(60)))
+        .build();
+    transport.send(&message).map_err(|e| {
+        if e.is_permanent() && e.to_string().contains("535") {
+            "Gmail rejected the app password".to_string()
+        } else {
+            format!("Sending failed: {e}")
+        }
+    })?;
+    Ok(())
+}
+
+fn build_message(account: &Account, out: &Outgoing, forwarded: Vec<(String, String, Vec<u8>)>) -> Result<Message, String> {
     let to = parse_recipients(&out.to)?;
     let cc = parse_recipients(&out.cc)?;
     let bcc = parse_recipients(&out.bcc)?;
@@ -147,26 +166,25 @@ pub fn send(
     }
     .map_err(|e| format!("Could not build the message: {e}"))?;
 
-    // Gmail stores a copy in Sent by itself, so nothing is appended over IMAP.
-    let transport = SmtpTransport::relay(&account.smtp_host)
-        .map_err(|e| e.to_string())?
-        .port(account.smtp_port)
-        .credentials(Credentials::new(account.email.clone(), password.to_string()))
-        .timeout(Some(Duration::from_secs(60)))
-        .build();
-    transport.send(&message).map_err(|e| {
-        if e.is_permanent() && e.to_string().contains("535") {
-            "Gmail rejected the app password".to_string()
-        } else {
-            format!("Sending failed: {e}")
-        }
-    })?;
-    Ok(())
+    Ok(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_replies_and_forwards_use_the_originating_envelope_and_from() {
+        for email in ["home@example.test", "work@example.test"] {
+            for (reply, forwarded) in [("", 0), ("<previous@example.test>", 0), ("", 42)] {
+                let out = Outgoing { to: "recipient@example.test".into(), in_reply_to: reply.into(), forward_uid: forwarded, ..Default::default() };
+                let message = build_message(&Account::gmail(email), &out, vec![]).unwrap();
+                assert_eq!(message.envelope().from().unwrap().to_string(), email);
+                assert!(String::from_utf8(message.formatted()).unwrap().lines().any(|l| l == format!("From: {email}")));
+            }
+        }
+    }
+
 
     #[test]
     fn splits_recipients_outside_quotes() {

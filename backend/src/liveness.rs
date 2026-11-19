@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,54 @@ impl Drop for Tracked {
     }
 }
 
+/// Retires one panel IDLE worker without disturbing the other connections.
+/// Register before TLS so an account switch can interrupt login and IDLE.
+#[derive(Default)]
+pub struct SocketCancel {
+    stopped: AtomicBool,
+    socket_id: Mutex<Option<u64>>,
+}
+
+impl SocketCancel {
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    pub fn check(&self) -> std::io::Result<()> {
+        if self.stopped() {
+            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "mailbox session ended"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn track(&self, socket: &Tracked) -> std::io::Result<()> {
+        let mut id = lock(&self.socket_id);
+        self.check()?;
+        *id = Some(socket.id);
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        // Lock the same predicate as the backoff wait to avoid a lost wake.
+        {
+            let _guard = lock(&KICKS);
+            self.stopped.store(true, Ordering::Release);
+            KICKED.notify_all();
+        }
+        let id = *lock(&self.socket_id);
+        if let Some(id) = id
+            && let Some((_, socket)) = lock(&SOCKETS).iter().find(|(key, _)| *key == id)
+        {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub fn sleep(&self, duration: Duration, since: u64) -> bool {
+        wait_for_kick(duration, since, || self.stopped())
+    }
+}
+
 /// Cuts every registered connection short (blocked reads return at once and
 /// their owners reconnect) and wakes everyone in `sleep`.
 pub fn kick(reason: &str) {
@@ -131,8 +179,14 @@ pub fn kicks() -> u64 {
 /// Sleeps for `duration`, or until a kick newer than `since`. Returns true
 /// when it was cut short: the network is probably back, retry now.
 pub fn sleep(duration: Duration, since: u64) -> bool {
+    wait_for_kick(duration, since, || false)
+}
+
+fn wait_for_kick(duration: Duration, since: u64, stopped: impl Fn() -> bool) -> bool {
     let guard = lock(&KICKS);
-    let (guard, _) = KICKED.wait_timeout_while(guard, duration, |k| *k == since).unwrap_or_else(|e| e.into_inner());
+    let (guard, _) = KICKED
+        .wait_timeout_while(guard, duration, |k| *k == since && !stopped())
+        .unwrap_or_else(|e| e.into_inner());
     *guard != since
 }
 

@@ -1,6 +1,6 @@
 //! Newest message headers, so the list can paint before IMAP answers.
 //!
-//! One file, `~/.local/state/omamail/list.json`, mode 0600. It holds
+//! One file per account, `~/.local/state/omamail/accounts/<id>/list.json`, mode 0600. It holds
 //! subjects and senders — a subject may be a verification code — and never
 //! a body or the app password, so it lives with the other state file rather
 //! than in the cache. Nothing in it is logged. Sign-out deletes the file.
@@ -12,7 +12,7 @@
 use crate::mailbox::{self, Page, Person, Summary};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,8 +40,8 @@ struct Store {
     folders: HashMap<String, FolderCache>,
 }
 
-fn path() -> PathBuf {
-    crate::config::state_dir().join("list.json")
+fn path(id: &str) -> PathBuf {
+    crate::accounts::state(id).join("list.json")
 }
 
 fn empty() -> Page {
@@ -52,47 +52,15 @@ fn empty() -> Page {
     }
 }
 
-pub fn load(email: &str, folder: &str) -> Page {
-    read_at(&path(), email, folder)
+pub fn load(id: &str, email: &str, folder: &str) -> Page {
+    read_at(&path(id), email, folder)
 }
 
-pub fn store(email: &str, folder: &str, page: &Page) {
+pub fn store(id: &str, email: &str, folder: &str, page: &Page) {
     if email.is_empty() || folder.is_empty() || folder.len() > 1024 {
         return;
     }
-    write_at(&path(), email, folder, page);
-}
-
-pub fn clear() {
-    clear_at(&path());
-}
-
-/// Forgets the file unless it is this account's. Signing in as someone
-/// else must not leave the previous subjects on disk until the next list
-/// happens to overwrite them, even in a file this version cannot read.
-pub fn retain(email: &str) {
-    drop_other(&path(), email);
-}
-
-/// Also removes temp files of a write the process did not live to rename.
-fn clear_at(path: &Path) {
-    let _ = fs::remove_file(path);
-    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
-        return;
-    };
-    let prefix = format!("{stem}.tmp.");
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(&prefix))
-        {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
+    write_at(&path(id), email, folder, page);
 }
 
 fn now() -> u64 {
@@ -203,14 +171,9 @@ fn write_at(path: &Path, email: &str, folder: &str, page: &Page) {
     let _ = crate::config::write_private(path, &text);
 }
 
-fn drop_other(path: &Path, email: &str) {
-    if read_store(path).is_none_or(|s| s.email != email) {
-        clear_at(path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -337,27 +300,6 @@ mod tests {
         fs::write(&path, br#"{"v":99,"email":"a@ex.com","folders":{}}"#).unwrap();
         assert!(read_at(&path, "a@ex.com", "INBOX").messages.is_empty());
 
-        write_at(
-            &path,
-            "a@ex.com",
-            "INBOX",
-            &page(vec![sample(2, "keep")], 1, 1),
-        );
-        drop_other(&path, "a@ex.com");
-        assert_eq!(read_at(&path, "a@ex.com", "INBOX").messages[0].uid, 2);
-        drop_other(&path, "b@ex.com");
-        assert!(read_at(&path, "a@ex.com", "INBOX").messages.is_empty());
-        assert!(!path.exists());
-
-        // An unreadable file and a write cut off before its rename are
-        // gone too, but nothing else in the folder is.
-        fs::write(&path, b"not json").unwrap();
-        let tmp = dir.join("list.tmp.1.0");
-        fs::write(&tmp, b"partial").unwrap();
-        fs::write(dir.join("watch.json"), b"{}").unwrap();
-        drop_other(&path, "a@ex.com");
-        assert!(!path.exists() && !tmp.exists());
-        assert!(dir.join("watch.json").exists());
         let _ = fs::remove_dir_all(dir);
     }
 
