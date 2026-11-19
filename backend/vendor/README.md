@@ -19,7 +19,10 @@ As a path dependency, this crate no longer receives Cargo's registry lint
 caps. `src/lib.rs` explicitly allows the external-macro variant of that
 lint (from unmodified `nom` 5), upstream dead-code and lifetime-style
 warnings, and three Clippy style lints from its code and tests. The
-local-macro compatibility lint remains denied.
+local-macro compatibility lint remains denied. The external-macro lint
+exists in Rust 1.100 but not in older toolchains (1.89, 1.97), so
+`unknown_lints` is allowed too; without it those builds warn about the
+name.
 Remove this patch when upgrading to an IMAP client that uses a newer parser.
 
 Run the upstream parser tests, using the application's lockfile, with:
