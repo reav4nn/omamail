@@ -80,7 +80,7 @@ focus_ws "$shot_ws"
 for i in "${!themes[@]}"; do
   omarchy theme set "${themes[$i]}" >/dev/null 2>&1
   sleep 4
-  omarchy-shell shell summon reavann.omamail '{"folder":"INBOX","uid":211}' >/dev/null
+  omarchy-shell shell summon reavann.omamail '{"account":"00000000000000000000000000000001","folder":"INBOX","uid":211,"uidvalidity":1}' >/dev/null
   sleep 3
   id=$(notify --method org.freedesktop.Notifications.Notify "Omamail" 0 "" "Lumen" \
     "<b>482913</b>  ·  click to copy

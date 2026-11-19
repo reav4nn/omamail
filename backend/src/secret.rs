@@ -29,33 +29,41 @@ pub fn store(account: &str, password: &str) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "Could not save the password to the keyring: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+        Err("Could not save the password to the desktop keyring".into())
     }
 }
 
-pub fn lookup(account: &str) -> Option<String> {
+pub fn lookup(account: &str) -> Result<Option<String>, String> {
     let out = Command::new("secret-tool")
         .arg("lookup")
         .args(ATTRS)
         .arg(account)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
         .output()
-        .ok()?;
-    let password = String::from_utf8(out.stdout).ok()?;
-    (out.status.success() && !password.is_empty()).then_some(password)
+        .map_err(|e| format!("Could not read the keyring: {e}"))?;
+    if out.status.code() == Some(1) && out.stderr.is_empty() {
+        return Ok(None);
+    }
+    if !out.status.success() {
+        return Err("Could not read the desktop keyring".into());
+    }
+    let password = String::from_utf8(out.stdout).map_err(|_| "Invalid password in keyring")?;
+    Ok((!password.is_empty()).then_some(password))
 }
 
-pub fn clear(account: &str) {
-    let _ = Command::new("secret-tool")
+pub fn clear(account: &str) -> Result<(), String> {
+    let status = Command::new("secret-tool")
         .arg("clear")
         .args(ATTRS)
         .arg(account)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .map_err(|e| format!("Could not remove password: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Could not remove password from the keyring".into())
+    }
 }

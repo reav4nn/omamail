@@ -23,9 +23,9 @@ const MAX_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 3;
 const WORKERS: usize = 6;
 
-pub fn fetch_all(urls: &[String]) -> HashMap<String, PathBuf> {
+pub fn fetch_all(account: &str, urls: &[String]) -> HashMap<String, PathBuf> {
     let urls: Vec<&String> = urls.iter().take(MAX_IMAGES).collect();
-    let Ok(dir) = crate::config::private_cache("images") else { return HashMap::new() };
+    let Ok(dir) = crate::config::private_cache(&format!("accounts/{account}/images")) else { return HashMap::new() };
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)

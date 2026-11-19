@@ -190,23 +190,28 @@ fn folders() -> Vec<Folder> {
     ]
 }
 
-fn messages(folder: &str) -> Vec<Summary> {
+fn messages(folder: &str, email: &str) -> Vec<Summary> {
     let keep = |m: &&Mail| match folder {
         "INBOX" | "[Gmail]/All Mail" => true,
         "[Gmail]/Starred" => m.flagged,
         _ => false,
     };
-    INBOX.iter().filter(keep).map(summary).collect()
+    INBOX.iter().filter(keep).map(|m| {
+        let mut s = summary(m);
+        if email != ME.1 { s.subject = format!("[{email}] {}", s.subject); }
+        s
+    }).collect()
 }
 
-fn raw(uid: u32) -> Option<Vec<u8>> {
+fn raw(uid: u32, email: &str) -> Option<Vec<u8>> {
     let m = INBOX.iter().find(|m| m.uid == uid)?;
+    let subject = if email == ME.1 { m.subject.into() } else { format!("[{email}] {}", m.subject) };
     let date = rfc2822(now() - m.ago * 60);
     Some(
         format!(
             "From: {} <{}>\r\nTo: {} <{}>\r\nSubject: {}\r\nDate: {date}\r\nMIME-Version: 1.0\r\n\
              Content-Type: text/html; charset=utf-8\r\n\r\n<html><body>{}</body></html>\r\n",
-            m.from.0, m.from.1, ME.0, ME.1, m.subject, m.html
+            m.from.0, m.from.1, "Demo", email, subject, m.html
         )
         .into_bytes(),
     )
@@ -239,18 +244,12 @@ fn rfc2822(ts: i64) -> String {
     )
 }
 
-/// The reply to a request. Changes to mail succeed and do nothing; anything
-/// that would reach the real account (signing in or out, sending, saving
-/// attachments) is refused here. None only for commands the real handler
-/// does not know either, so it rejects them.
-pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
+/// Fixture-only dispatch; unknown commands never fall through to real I/O.
+pub fn dispatch(req: &Value, email: &str) -> Result<Value, String> {
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or_default();
     let folder = req.get("folder").and_then(Value::as_str).unwrap_or("INBOX");
     let uid = req.get("uid").and_then(Value::as_u64).unwrap_or(0) as u32;
-    Some(match cmd {
-        "status" => {
-            Ok(json!({"configured": true, "email": ME.1, "version": env!("CARGO_PKG_VERSION")}))
-        }
+    match cmd {
         "folders" => Ok(json!(folders())),
         "unread" => Ok(json!(
             folders()
@@ -259,7 +258,7 @@ pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
                 .map_or(0, |f| f.unread)
         )),
         "list" => {
-            let messages = messages(folder);
+            let messages = messages(folder, email);
             Ok(json!(Page {
                 total: messages.len() as u32,
                 messages,
@@ -267,7 +266,7 @@ pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
             }))
         }
         "cached" => {
-            let messages = messages(folder);
+            let messages = messages(folder, email);
             Ok(json!(Page {
                 total: messages.len() as u32,
                 messages,
@@ -280,7 +279,7 @@ pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_lowercase();
-            let messages: Vec<Summary> = messages(folder)
+            let messages: Vec<Summary> = messages(folder, email)
                 .into_iter()
                 .filter(|m| {
                     m.subject.to_lowercase().contains(&query)
@@ -293,20 +292,20 @@ pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
                 uidvalidity: 1
             }))
         }
-        "open" => raw(uid)
+        "open" => raw(uid, email)
             .map(|raw| json!(message::render(&raw, uid, false)))
             .ok_or_else(|| "No such message".into()),
         "draft" => {
             let mode = req.get("mode").and_then(Value::as_str).unwrap_or("reply");
-            raw(uid)
-                .and_then(|raw| message::draft(&raw, mode, ME.1))
+            raw(uid, email)
+                .and_then(|raw| message::draft(&raw, mode, email))
                 .map(|d| json!(d))
                 .ok_or_else(|| "No such message".into())
         }
         "flag" | "move" | "undo" => Ok(Value::Null),
         "login" | "logout" | "send" | "attachment" => Err("Not available in the demo build".into()),
-        _ => return None,
-    })
+        _ => Err("Unsupported demo command".into()),
+    }
 }
 
 #[cfg(test)]
@@ -322,15 +321,14 @@ mod tests {
     #[test]
     fn every_message_renders() {
         for m in INBOX {
-            let view = json!(message::render(&raw(m.uid).unwrap(), m.uid, false));
+            let view = json!(message::render(&raw(m.uid, ME.1).unwrap(), m.uid, false));
             assert_eq!(view["subject"], m.subject);
         }
-        let page = dispatch(&json!({"cmd": "list", "folder": "INBOX"}))
-            .unwrap()
+        let page = dispatch(&json!({"cmd": "list", "folder": "INBOX"}), ME.1)
             .unwrap();
         for cmd in ["login", "logout", "send", "attachment"] {
             assert!(
-                matches!(dispatch(&json!({"cmd": cmd})), Some(Err(_))),
+                dispatch(&json!({"cmd": cmd}), ME.1).is_err(),
                 "{cmd} must not reach the real handler"
             );
         }
