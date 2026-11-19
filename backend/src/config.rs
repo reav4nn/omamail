@@ -93,26 +93,6 @@ impl Account {
     }
 }
 
-fn account_file() -> PathBuf {
-    config_dir().join("config.json")
-}
-
-pub fn load_account() -> Option<Account> {
-    let text = fs::read_to_string(account_file()).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-pub fn save_account(account: &Account) -> std::io::Result<()> {
-    let text = serde_json::to_string_pretty(account).map_err(std::io::Error::other)?;
-    write_private(&account_file(), text.as_bytes())
-}
-
-pub fn remove_account() {
-    let _ = fs::remove_file(account_file());
-    let _ = fs::remove_file(state_dir().join("watch.json"));
-    crate::listcache::clear();
-}
-
 /// Atomic write, readable only by the user.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {

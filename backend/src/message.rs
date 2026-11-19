@@ -131,7 +131,12 @@ fn content_id(part: &MessagePart) -> Option<String> {
     part.content_id().map(|id| id.trim().trim_matches(['<', '>']).to_string())
 }
 
+#[cfg(any(test, feature="demo"))]
 pub fn render(raw: &[u8], uid: u32, load_images: bool) -> View {
+    render_for(raw, uid, load_images, None)
+}
+
+pub fn render_for(raw: &[u8], uid: u32, load_images: bool, account: Option<&str>) -> View {
     let Some(msg) = parse(raw) else {
         return View {
             uid,
@@ -154,10 +159,10 @@ pub fn render(raw: &[u8], uid: u32, load_images: bool) -> View {
     // Inline parts the reader shows are left out of the attachment list.
     let (html, remote_images, images_loaded, shown) = match html_part.and_then(|p| p.text_contents()) {
         Some(source) => {
-            let inline = extract_inline_images(&msg, source);
+            let inline = account.map(|id| extract_inline_images(&msg, source, id)).unwrap_or_default();
             let first = clean_html(source, &inline, None);
-            if load_images && !first.remote_images.is_empty() {
-                let fetched = images::fetch_all(&first.remote_images);
+            if let Some(id) = account && load_images && !first.remote_images.is_empty() {
+                let fetched = images::fetch_all(id, &first.remote_images);
                 let second = clean_html(source, &inline, Some(&fetched));
                 (second.html, first.remote_images.len(), true, second.inline_shown)
             } else {
@@ -201,12 +206,12 @@ pub fn render(raw: &[u8], uid: u32, load_images: bool) -> View {
 }
 
 /// Writes `cid:`-referenced images to the cache so the reader can show them.
-fn extract_inline_images(msg: &Message, html: &str) -> HashMap<String, PathBuf> {
+fn extract_inline_images(msg: &Message, html: &str, account: &str) -> HashMap<String, PathBuf> {
     let mut map = HashMap::new();
     if !html.to_ascii_lowercase().contains("cid:") {
         return map;
     }
-    let Ok(dir) = crate::config::private_cache("inline") else { return map };
+    let Ok(dir) = crate::config::private_cache(&format!("accounts/{account}/inline")) else { return map };
     for part in msg.attachments() {
         let Some(id) = content_id(part) else { continue };
         let mime = mime_of(part);

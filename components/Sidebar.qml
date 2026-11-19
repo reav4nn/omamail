@@ -28,14 +28,12 @@ Item {
       font.bold: true
     }
 
-    Text {
-      textFormat: Text.PlainText
+    Button {
       width: parent.width
+      leftAlign: true
       text: root.app.email
-      elide: Text.ElideMiddle
-      color: Qt.darker(Color.foreground, 1.4)
-      font.family: Style.font.family
-      font.pixelSize: Style.font.caption
+      tooltipText: "Manage accounts: " + root.app.email
+      onClicked: root.app.manageAccounts()
     }
 
     Item { width: 1; height: Style.space(10) }
@@ -134,8 +132,8 @@ Item {
 
     Button {
       iconText: Fmt.icons.logout
-      tooltipText: "Sign out"
-      onClicked: root.app.confirmSignOut()
+      tooltipText: "Manage accounts"
+      onClicked: root.app.manageAccounts()
     }
 
     Button {

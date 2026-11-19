@@ -18,7 +18,7 @@ Item {
   }
 
   Component.onCompleted: {
-    emailField.text = root.app.email
+    emailField.text = root.app.loginAddress
     Qt.callLater(focusFirst)
   }
 
@@ -71,6 +71,12 @@ Item {
       font.family: Style.font.family
       font.pixelSize: Style.font.bodySmall
       text: root.app.signInError
+    }
+
+    Button {
+      visible: root.app.accounts.length > 0
+      text: "Saved accounts"
+      onClicked: root.app.manageAccounts()
     }
 
     Row {

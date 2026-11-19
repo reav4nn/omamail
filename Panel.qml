@@ -29,10 +29,10 @@ Item {
     var target = null
     try {
       var p = payloadJson ? JSON.parse(String(payloadJson)) : null
-      if (p && typeof p.folder === "string") target = p
+      if (p && p.account && p.folder === "INBOX" && p.uidvalidity > 0) target = p
     } catch (e) {}
     if (target) {
-      if (phase === "mail") showMessage(target.folder, target.uid, true)
+      if (backend.session) routeTarget(target)
       else pendingTarget = target
     }
     Qt.callLater(focusList)
@@ -46,6 +46,14 @@ Item {
   }
 
   function requestClose() {
+    if (sending || busy || confirming) { window.visible = true; return }
+    if (draft) {
+      window.visible = true
+      askConfirm("Discard this draft and close Omamail?", "Discard", function() { draft = null; hideWindow() })
+    } else hideWindow()
+  }
+
+  function hideWindow() {
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
     else close()
   }
@@ -64,7 +72,6 @@ Item {
     onExited: function(code) {
       if (code === 0) {
         mailApp.backendReady = true
-        mailApp.start()
       } else {
         mailApp.phase = "setup"
       }
@@ -74,11 +81,23 @@ Item {
   property Backend backend: Backend {
     binary: mailApp.backendReady ? mailApp.backendPath : ""
     onChanged: function(folder) { mailApp.onServerChange(folder) }
-    onFailed: function(message) { mailApp.flash(message) }
+    onReady: mailApp.start()
+    onFailed: function(message) {
+      mailApp.busy = false
+      if (mailApp.sending) mailApp.sendError = "Delivery unknown: the backend stopped. Check Sent before retrying."
+      mailApp.sending = false
+      mailApp.phase = "loading"
+      mailApp.resetMailbox()
+      mailApp.flash(message)
+    }
   }
 
   property string phase: "loading"   // loading | signin | mail
   property string email: ""
+  property var accounts: []
+  property string accountId: ""
+  property bool configured: false
+  property string loginAddress: ""
   property string signInError: ""
   property bool busy: false
   property var pendingTarget: null
@@ -145,7 +164,10 @@ Item {
 
   function handleError(message, code) {
     if (code === "auth" || code === "not_configured") {
-      signInError = code === "auth" ? message : ""
+      if (phase !== "mail" || busy) return
+      loginAddress = email
+      configured = false
+      signInError = message
       phase = "signin"
       return
     }
@@ -155,51 +177,88 @@ Item {
   // ---- account -------------------------------------------------------------
   function start() {
     backend.request("status", {}, function(ok, data) {
-      if (!ok) { phase = "signin"; return }
-      email = data.email || ""
-      version = data.version || ""
-      if (data.configured) enterMail()
-      else phase = "signin"
+      if (!ok) { phase = "signin"; signInError = data; return }
+      applyAccount(data)
+      var target = pendingTarget
+      pendingTarget = null
+      if (target) routeTarget(target)
     })
+  }
+
+  function resetMailbox() {
+    openTimer.stop(); statusTimer.stop()
+    ++listToken; dropView(); viewFolder = ""; viewValidity = 0; currentFlagged = false
+    messages.clear(); folders = []; folder = "INBOX"; setQuery("")
+    loadingList = false; loadingMore = false; listError = ""; listValidity = 0; listLive = false
+    total = 0; selectedUid = -1; cursor = -1; refreshPending = false
+    undoId = 0; pendingSelectUid = -1; pendingSelectFolder = ""; pendingSelectValidity = 0
+    status = ""; hoveredLink = ""; aboutOpen = false; confirming = false; confirmAction = null
+  }
+
+  function applyAccount(data) {
+    if (backend.session !== data.session) resetMailbox()
+    backend.session = data.session
+    accountId = data.account || ""; accounts = data.accounts; email = data.email || ""
+    version = data.version; configured = data.configured; signInError = data.error || ""
+    loginAddress = email
+    phase = configured ? "mail" : "signin"
+    if (configured) { pollTimer.restart(); loadList(true); loadFolders() }
+  }
+
+  function manageAccounts() {
+    if (busy || confirming) return
+    if (sending) return flash("Wait for sending to finish")
+    signInError = ""; phase = "accounts"
+  }
+
+  function backToMailbox() {
+    if (busy) return
+    phase = configured ? "mail" : "signin"
+    loginAddress = email; signInError = ""
+  }
+
+  function loginForm(address) {
+    loginAddress = address; signInError = ""; phase = "signin"
+  }
+
+  // Keep the editor mounted and its text intact until the change succeeds.
+  function changeAccount(cmd, args, discard, after) {
+    if (busy || sending || confirming) return
+    function run() {
+      busy = true; signInError = ""
+      backend.request(cmd, args, function(ok, data) {
+        busy = false
+        if (!ok) { signInError = data; flash(data); return }
+        if (discard) { draft = null; sendError = "" }
+        applyAccount(data)
+        if (after) after()
+      })
+    }
+    if (cmd === "remove") {
+      var row = accounts.find(function(a) { return a.id === args.account })
+      if (!row) return
+      askConfirm("Remove " + row.email + " from Omamail? Its saved password and local mail data will be removed."
+          + (discard && draft ? " The current draft will be discarded." : ""), "Remove", run)
+    } else if (discard && draft) askConfirm("Discard this draft and change account?", "Discard", run)
+    else run()
   }
 
   function signIn(address, password) {
-    busy = true
-    signInError = ""
-    backend.request("login", { email: address, password: password }, function(ok, data) {
-      busy = false
-      if (!ok) { signInError = data; return }
-      email = data.email
-      // Rows left by an auth error may be another account's: start empty,
-      // or selectFolder would refresh them in place as if confirmed.
-      messages.clear()
-      view = null
-      enterMail()
-    })
+    changeAccount("login", {email: address, password: password}, !!draft && draft.owner !== (accounts.find(function(a) {
+      return a.email.toLowerCase() === address.trim().toLowerCase()
+    }) || {}).id)
   }
 
-  function confirmSignOut() {
-    askConfirm("Sign out of " + email + "? The app password is removed from the keyring.", "Sign out", function() {
-      backend.request("logout", {}, function() {
-        folders = []
-        messages.clear()
-        view = null
-        draft = null
-        phase = "signin"
-      })
-    })
-  }
-
-  // The backend answers in order: the list (or the clicked message) first,
-  // then the folder counts, which take a round trip per label.
-  function enterMail() {
-    phase = "mail"
-    signInError = ""
-    var target = pendingTarget
-    pendingTarget = null
-    if (target) showMessage(target.folder, target.uid, true)
-    else selectFolder(folder)
-    loadFolders()
+  function routeTarget(target) {
+    if (busy || sending || confirming || !accounts.some(function(a) { return a.id === target.account })) return
+    function show() {
+      if (target.account !== accountId || !configured) return
+      phase = "mail"
+      showMessage(target.folder, target.uid, true, target.uidvalidity)
+    }
+    if (target.account !== accountId || !configured) changeAccount("select", {account:target.account}, true, show)
+    else if (draft) askConfirm("Discard this draft and open the notification?", "Discard", function() { draft = null; show() })
+    else show()
   }
 
   // ---- folders -------------------------------------------------------------
@@ -450,7 +509,8 @@ Item {
   function runPendingRefresh() {
     if (!refreshPending) return
     refreshPending = false
-    Qt.callLater(function() { if (!mailApp.loadingList && mailApp.query.length === 0) mailApp.loadList(false) })
+    var session = backend.session
+    Qt.callLater(function() { if (session === backend.session && phase === "mail" && !mailApp.loadingList && mailApp.query.length === 0) mailApp.loadList(false) })
   }
 
   function refreshAll() {
@@ -481,7 +541,7 @@ Item {
   }
 
   // From a notification click: show that folder's list with the mail open.
-  function showMessage(path, uid, force) {
+  function showMessage(path, uid, force, validity) {
     if (force || path !== folder || messages.count === 0) {
       folder = path
       setQuery("")
@@ -490,7 +550,7 @@ Item {
     if (uid) {
       selectedUid = uid
       syncCursor()
-      fetchMessage(path, uid, false)
+      fetchMessage(path, uid, false, validity)
     }
   }
 
@@ -518,11 +578,11 @@ Item {
     return true
   }
 
-  function fetchMessage(path, uid, images) {
+  function fetchMessage(path, uid, images, expected) {
     var token = ++viewToken
     loadingView = true
     viewError = ""
-    var validity = generationFor(path, uid)
+    var validity = expected || generationFor(path, uid)
     if (!images) {
       view = null
       viewValidity = 0
@@ -682,7 +742,7 @@ Item {
     if (draft) return
     sendError = ""
     if (mode === "new") {
-      draft = { to: to || "", cc: "", subject: "", body: "", in_reply_to: "", references: "",
+      draft = { owner: accountId, from: email, to: to || "", cc: "", subject: "", body: "", in_reply_to: "", references: "",
                 attachments: [], forward_folder: "", forward_uid: 0 }
       return
     }
@@ -692,6 +752,8 @@ Item {
     var validity = generationFor(source, uid)
     backend.request("draft", { folder: source, uid: uid, mode: mode, uidvalidity: validity }, function(ok, data, code) {
       if (!ok) return handleError(data, code)
+      if (phase !== "mail" || draft || busy) return
+      data.owner = accountId; data.from = email
       data.forward_folder = mode === "forward" ? source : ""
       data.forward_uid = mode === "forward" ? uid : 0
       data.uidvalidity = mode === "forward" ? validity : 0
@@ -702,7 +764,8 @@ Item {
   // The result lands here, not in the composer, so it is reported even if
   // the composer is gone by then.
   function sendDraft(message) {
-    if (sending) return
+    if (sending || busy || phase !== "mail" || !draft) return
+    if (draft.owner !== accountId) { sendError = "Switch back to the draft’s account before sending"; return }
     sending = true
     sendError = ""
     backend.request("send", message, function(ok, data) {
@@ -765,6 +828,8 @@ Item {
 
   function handleKey(event) {
     if (confirming) return confirmDialog.handleKey(event)
+    if (busy) return true
+    if (event.key === Qt.Key_Escape && phase === "accounts") { backToMailbox(); return true }
     if (aboutOpen && phase === "mail") {
       if (event.key === Qt.Key_Escape || event.key === Qt.Key_Question || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) aboutOpen = false
       return true
@@ -839,6 +904,7 @@ Item {
   // Labels get no push from the server (IDLE watches INBOX only), and a
   // missed push must not leave the list stale for long either.
   Timer {
+    id: pollTimer
     interval: 3 * 60 * 1000
     repeat: true
     running: mailApp.phase === "mail"
@@ -931,8 +997,15 @@ Item {
         sourceComponent: SignIn { app: mailApp }
       }
 
+      Loader {
+        anchors.fill: parent
+        active: mailApp.phase === "accounts"
+        sourceComponent: Accounts { app: mailApp }
+      }
+
       Item {
         id: mailView
+        enabled: !mailApp.busy
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
