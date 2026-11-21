@@ -43,7 +43,6 @@ pub fn clean_html(
 ) -> Clean {
     let found: Arc<Mutex<Vec<String>>> = Arc::default();
     let by_cid = Arc::new(inline.clone());
-    let remote = Arc::new(remote.cloned());
     let filter_found = Arc::clone(&found);
     let resolved: Arc<Mutex<HashSet<String>>> = Arc::default();
     let filter_resolved = Arc::clone(&resolved);
@@ -80,12 +79,14 @@ pub fn clean_html(
                         return Some(file_url(path).into());
                     }
                     if is_web(value) {
-                        if let Ok(mut list) = filter_found.lock()
-                            && !list.iter().any(|u| u == value)
-                        {
+                        // Whether it counts is known only once hidden
+                        // elements are gone (see `place_remote`).
+                        let mut list = filter_found.lock().ok()?;
+                        let index = list.iter().position(|u| u == value).unwrap_or_else(|| {
                             list.push(value.to_string());
-                        }
-                        return remote.as_ref().as_ref().and_then(|m| m.get(value)).map(|p| file_url(p).into());
+                            list.len() - 1
+                        });
+                        return Some(format!("{REMOTE}{index}").into());
                     }
                     None
                 }
@@ -98,8 +99,9 @@ pub fn clean_html(
             }
         });
     let cleaned = builder.clean(html).to_string();
-    let remote_images = found.lock().map(|l| l.clone()).unwrap_or_default();
-    let html = tidy(&fit_images(&remove_hidden(&cleaned)));
+    let found = found.lock().map(|l| l.clone()).unwrap_or_default();
+    let (visible, remote_images) = place_remote(&remove_hidden(&cleaned), &found, remote);
+    let html = tidy(&fit_images(&visible));
     // Hidden elements and images that could not be sized are gone by now.
     // Parts with equal bytes share a file, so the cid must also have been used.
     let shown = image_sources(&html);
@@ -473,6 +475,42 @@ fn remove_hidden(html: &str) -> String {
     out
 }
 
+/// `src` the attribute filter gives every remote image: the scheme check
+/// has already run, so no value from the mail can look like it.
+const REMOTE: &str = "omamail-remote:";
+
+/// Images in hidden elements (tracking pixels) are neither offered nor
+/// fetched. Each remaining remote image gets its downloaded copy; one
+/// without a copy keeps the marker, and `fit_images` drops it. Returns the
+/// remote URLs still in the mail, in document order.
+fn place_remote(html: &str, found: &[String], remote: Option<&HashMap<String, PathBuf>>) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(html.len());
+    let mut urls: Vec<String> = Vec::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<img") {
+        let end = rest[start..].find('>').map_or(rest.len(), |e| start + e + 1);
+        let tag = &rest[start..end];
+        out.push_str(&rest[..start]);
+        rest = &rest[end..];
+        let src = attr(tag, "src");
+        let index = src.as_deref().and_then(|s| s.strip_prefix(REMOTE)?.parse::<usize>().ok());
+        let Some((index, url)) = index.and_then(|i| Some((i, found.get(i)?))) else {
+            out.push_str(tag);
+            continue;
+        };
+        if seen.insert(index) {
+            urls.push(url.clone());
+        }
+        match remote.and_then(|m| m.get(url)) {
+            Some(path) => out.push_str(&tag.replacen(&format!(" src=\"{}\"", src.unwrap_or_default()), &format!(" src=\"{}\"", file_url(path)), 1)),
+            None => out.push_str(tag),
+        }
+    }
+    out.push_str(rest);
+    (out, urls)
+}
+
 fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
     value.get(..scheme.len()).filter(|p| p.eq_ignore_ascii_case(scheme)).map(|_| &value[scheme.len()..])
 }
@@ -653,6 +691,36 @@ mod tests {
         let out = clean(r#"<p>x</p><img src="https://tracker.example/p.gif"><img src="http://a.b/c.png">"#);
         assert!(!out.html.contains("<img"), "{}", out.html);
         assert_eq!(out.remote_images, vec!["https://tracker.example/p.gif", "http://a.b/c.png"]);
+    }
+
+    #[test]
+    fn hidden_remote_images_are_neither_offered_nor_fetched() {
+        let html = r#"<div style="display:none"><img src="https://tracker.example/open.gif"></div>
+            <img src="https://tracker.example/pixel.gif" style="display:none"><p>Hi</p>"#;
+        let out = clean(html);
+        assert!(out.remote_images.is_empty(), "{:?}", out.remote_images);
+        assert_eq!(out.html.trim(), "<p>Hi</p>");
+
+        let html = r#"<p style="display:none"><img src="https://t.example/a.png"></p><img src="https://cdn.example/b.png">"#;
+        assert_eq!(clean(html).remote_images, vec!["https://cdn.example/b.png"]);
+
+        // Loaded: the visible image shows its copy, the hidden one stays out.
+        let dir = std::env::temp_dir().join(format!("omamail-remote-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        png.extend_from_slice(&2u32.to_be_bytes());
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+        std::fs::write(&a, &png).unwrap();
+        std::fs::write(&b, &png).unwrap();
+        let fetched = HashMap::from([
+            ("https://t.example/a.png".to_string(), a.clone()),
+            ("https://cdn.example/b.png".to_string(), b.clone()),
+        ]);
+        let loaded = clean_html(html, &HashMap::new(), Some(&fetched)).html;
+        assert_eq!(loaded, format!(r#"<img src="{}" width="2" height="1">"#, file_url(&b)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
