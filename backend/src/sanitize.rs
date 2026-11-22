@@ -596,8 +596,18 @@ fn linkify(line: &str, out: &mut String) {
         out.push_str(&escape(&rest[..start]));
         let tail = &rest[start..];
         let mut end = tail.find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"').unwrap_or(tail.len());
-        while end > 0 && tail[..end].ends_with(['.', ',', ')', ';', ':', '!', '?', '\'']) {
-            end -= 1;
+        // A ")" is the sentence's unless the URL opened one ("…/Baku_(city)").
+        let opened = tail[..end].matches('(').count();
+        let mut closed = tail[..end].matches(')').count();
+        while end > 0 {
+            if tail[..end].ends_with(['.', ',', ';', ':', '!', '?', '\'']) {
+                end -= 1;
+            } else if tail[..end].ends_with(')') && closed > opened {
+                end -= 1;
+                closed -= 1;
+            } else {
+                break;
+            }
         }
         let url = &tail[..end];
         if url.len() <= "https://".len() {
@@ -837,6 +847,27 @@ mod tests {
         let html = text_to_html(r#"https://a.az/"onmouseover="x"#);
         assert!(html.contains(r#"href="https://a.az/""#), "{html}");
         assert!(!html.contains(r#""onmouseover"#), "{html}");
+    }
+
+    #[test]
+    fn plain_text_links_keep_their_own_parentheses() {
+        let html = text_to_html("Read https://en.wikipedia.org/wiki/Baku_(city) first.");
+        assert!(html.contains(r#"href="https://en.wikipedia.org/wiki/Baku_(city)""#), "{html}");
+        assert!(html.contains(">https://en.wikipedia.org/wiki/Baku_(city)</a> first."), "{html}");
+        // The closing parenthesis of the sentence is still left out.
+        let html = text_to_html("(see https://a.az/x) and (https://en.wikipedia.org/wiki/Baku_(city)).");
+        assert!(html.contains(r#"href="https://a.az/x""#), "{html}");
+        assert!(html.contains(r#"href="https://en.wikipedia.org/wiki/Baku_(city)""#), "{html}");
+        assert!(html.contains("</a>)."), "{html}");
+    }
+
+    #[test]
+    fn closing_parentheses_after_a_link_are_trimmed_in_linear_time() {
+        let line = format!("https://a.az/x{}", ")".repeat(200_000));
+        let start = std::time::Instant::now();
+        let html = text_to_html(&line);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(html.contains(r#"href="https://a.az/x""#));
     }
 }
 
