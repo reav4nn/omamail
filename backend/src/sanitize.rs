@@ -24,10 +24,12 @@ const DROP_WITH_CONTENT: &[&str] = &["script", "style", "title", "noscript", "te
 /// (newsletter preheaders, tracking blocks). Every other style is dropped, so
 /// once styles are gone the hidden text would otherwise show up.
 const HIDDEN: &str = " style=\"display:none\"";
+// Ammonia checks URL schemes before the filter can write this marker.
+const REMOTE: &str = "omamail-remote:";
 
 pub struct Clean {
     pub html: String,
-    /// Remote image URLs found, in document order, whether or not they were shown.
+    /// Remote image URLs outside hidden elements, in document order.
     pub remote_images: Vec<String>,
     /// Keys of `inline` whose image is in `html`; the other parts are
     /// attachments the reader should list.
@@ -41,10 +43,9 @@ pub fn clean_html(
     inline: &HashMap<String, PathBuf>,
     remote: Option<&HashMap<String, PathBuf>>,
 ) -> Clean {
-    let found: Arc<Mutex<Vec<String>>> = Arc::default();
+    let candidates: Arc<Mutex<Vec<String>>> = Arc::default();
     let by_cid = Arc::new(inline.clone());
-    let remote = Arc::new(remote.cloned());
-    let filter_found = Arc::clone(&found);
+    let filter_candidates = Arc::clone(&candidates);
     let resolved: Arc<Mutex<HashSet<String>>> = Arc::default();
     let filter_resolved = Arc::clone(&resolved);
 
@@ -80,12 +81,10 @@ pub fn clean_html(
                         return Some(file_url(path).into());
                     }
                     if is_web(value) {
-                        if let Ok(mut list) = filter_found.lock()
-                            && !list.iter().any(|u| u == value)
-                        {
-                            list.push(value.to_string());
-                        }
-                        return remote.as_ref().as_ref().and_then(|m| m.get(value)).map(|p| file_url(p).into());
+                        let mut list = filter_candidates.lock().ok()?;
+                        let index = list.len();
+                        list.push(value.to_string());
+                        return Some(format!("{REMOTE}{index}").into());
                     }
                     None
                 }
@@ -98,8 +97,9 @@ pub fn clean_html(
             }
         });
     let cleaned = builder.clean(html).to_string();
-    let remote_images = found.lock().map(|l| l.clone()).unwrap_or_default();
-    let html = tidy(&fit_images(&remove_hidden(&cleaned)));
+    let candidates = candidates.lock().map(|mut list| std::mem::take(&mut *list)).unwrap_or_default();
+    let (fitted, remote_images) = fit_images(&remove_hidden(&cleaned), &candidates, remote);
+    let html = tidy(&fitted);
     // Hidden elements and images that could not be sized are gone by now.
     // Parts with equal bytes share a file, so the cid must also have been used.
     let shown = image_sources(&html);
@@ -514,12 +514,16 @@ fn file_path(url: &str) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8(bytes).ok()?))
 }
 
-/// Qt draws images at their natural size, so a 1200px newsletter banner would
-/// overflow the reader. Rewrites each <img> (ammonia's normalized output, so
-/// attributes are always `name="value"`) with a width/height that fits, and
-/// drops images whose source was removed.
-fn fit_images(html: &str) -> String {
+/// Collect remote URLs after hidden elements have been removed. Render
+/// local copies of images at a size that fits the Qt reader.
+fn fit_images(
+    html: &str,
+    candidates: &[String],
+    remote: Option<&HashMap<String, PathBuf>>,
+) -> (String, Vec<String>) {
     let mut out = String::with_capacity(html.len());
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
     let mut rest = html;
     while let Some(start) = rest.find("<img") {
         out.push_str(&rest[..start]);
@@ -529,8 +533,15 @@ fn fit_images(html: &str) -> String {
         };
         let tag = &rest[start..start + end + 1];
         rest = &rest[start + end + 1..];
-        let src = attr(tag, "src");
-        let Some(src) = src else { continue };
+        let Some(mut src) = attr(tag, "src") else { continue };
+        if let Some(marker) = src.strip_prefix(REMOTE) {
+            let Some(url) = marker.parse::<usize>().ok().and_then(|i| candidates.get(i)) else { continue };
+            if seen.insert(url.as_str()) {
+                urls.push(url.clone());
+            }
+            let Some(path) = remote.and_then(|copies| copies.get(url)) else { continue };
+            src = file_url(path);
+        }
         let Some(size) = file_path(&src).and_then(|p| imagesize::size(p).ok()) else { continue };
         let (w, h) = (size.width, size.height);
         if w == 0 || h == 0 {
@@ -542,7 +553,7 @@ fn fit_images(html: &str) -> String {
         out.push_str(&format!("<img src=\"{src}\" width=\"{width}\" height=\"{height}\">"));
     }
     out.push_str(rest);
-    out
+    (out, urls)
 }
 
 /// `src` of every <img> in the final output (text is escaped there).
@@ -596,7 +607,25 @@ fn linkify(line: &str, out: &mut String) {
         out.push_str(&escape(&rest[..start]));
         let tail = &rest[start..];
         let mut end = tail.find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"').unwrap_or(tail.len());
-        while end > 0 && tail[..end].ends_with(['.', ',', ')', ';', ':', '!', '?', '\'']) {
+        // Preserve the last closing parenthesis matched inside the URL.
+        let mut unmatched = 0;
+        let mut last_close = 0;
+        for (index, byte) in tail[..end].bytes().enumerate() {
+            match byte {
+                b'(' => unmatched += 1,
+                b')' if unmatched > 0 => {
+                    unmatched -= 1;
+                    last_close = index + 1;
+                }
+                _ => {}
+            }
+        }
+        while end > 0 {
+            match tail.as_bytes()[end - 1] {
+                b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' => {}
+                b')' if end > last_close => {}
+                _ => break,
+            }
             end -= 1;
         }
         let url = &tail[..end];
@@ -653,6 +682,37 @@ mod tests {
         let out = clean(r#"<p>x</p><img src="https://tracker.example/p.gif"><img src="http://a.b/c.png">"#);
         assert!(!out.html.contains("<img"), "{}", out.html);
         assert_eq!(out.remote_images, vec!["https://tracker.example/p.gif", "http://a.b/c.png"]);
+    }
+
+    #[test]
+    fn hidden_remote_images_are_neither_offered_nor_fetched() {
+        let html = r#"<div style="display:none"><img src="https://tracker.example/open.gif"></div>
+            <img src="https://tracker.example/pixel.gif" style="display:none"><p>Hi</p>"#;
+        let out = clean(html);
+        assert!(out.remote_images.is_empty(), "{:?}", out.remote_images);
+        assert_eq!(out.html.trim(), "<p>Hi</p>");
+
+        let html = r#"<p style="display:none"><img src="https://t.example/a.png"></p><img src="https://cdn.example/b.png">"#;
+        assert_eq!(clean(html).remote_images, vec!["https://cdn.example/b.png"]);
+
+        let repeated = format!(r#"{html}<img src="https://t.example/a.png"><img src="https://cdn.example/b.png">"#);
+        assert_eq!(clean(&repeated).remote_images, vec!["https://cdn.example/b.png", "https://t.example/a.png"]);
+
+        // Loaded: the visible image shows its copy, the hidden one stays out.
+        let dir = crate::test_support::TempDir::new();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        png.extend_from_slice(&2u32.to_be_bytes());
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let (a, b) = (dir.path().join("a.png"), dir.path().join("b.png"));
+        std::fs::write(&a, &png).unwrap();
+        std::fs::write(&b, &png).unwrap();
+        let fetched = HashMap::from([
+            ("https://t.example/a.png".to_string(), a.clone()),
+            ("https://cdn.example/b.png".to_string(), b.clone()),
+        ]);
+        let loaded = clean_html(html, &HashMap::new(), Some(&fetched)).html;
+        assert_eq!(loaded, format!(r#"<img src="{}" width="2" height="1">"#, file_url(&b)));
     }
 
     #[test]
@@ -837,6 +897,30 @@ mod tests {
         let html = text_to_html(r#"https://a.az/"onmouseover="x"#);
         assert!(html.contains(r#"href="https://a.az/""#), "{html}");
         assert!(!html.contains(r#""onmouseover"#), "{html}");
+    }
+
+    #[test]
+    fn plain_text_links_keep_their_own_parentheses() {
+        let html = text_to_html("Read https://en.wikipedia.org/wiki/Baku_(city) first.");
+        assert!(html.contains(r#"href="https://en.wikipedia.org/wiki/Baku_(city)""#), "{html}");
+        assert!(html.contains(">https://en.wikipedia.org/wiki/Baku_(city)</a> first."), "{html}");
+        // The closing parenthesis of the sentence is still left out.
+        let html = text_to_html("(see https://a.az/x) and (https://en.wikipedia.org/wiki/Baku_(city)).");
+        assert!(html.contains(r#"href="https://a.az/x""#), "{html}");
+        assert!(html.contains(r#"href="https://en.wikipedia.org/wiki/Baku_(city)""#), "{html}");
+        assert!(html.contains("</a>)."), "{html}");
+
+        let html = text_to_html("https://a.az/x)y(z)");
+        assert!(html.contains(r#"href="https://a.az/x)y(z)""#), "{html}");
+    }
+
+    #[test]
+    fn closing_parentheses_after_a_link_are_trimmed_in_linear_time() {
+        let line = format!("https://a.az/x{}", ")".repeat(200_000));
+        let start = std::time::Instant::now();
+        let html = text_to_html(&line);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(html.contains(r#"href="https://a.az/x""#));
     }
 }
 

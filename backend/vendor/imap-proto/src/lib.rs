@@ -2,6 +2,9 @@
 #![deny(semicolon_in_expressions_from_macros)]
 // nom 5's external macros still use this syntax. Cargo normally caps their
 // diagnostics for registry crates; keep this exception limited to external macros.
+// Rust 1.100 has that lint; older toolchains back to rust-version 1.89 do
+// not know its name and would warn "unknown lint" on every build.
+#![allow(unknown_lints)]
 #![allow(semicolon_in_expressions_from_non_local_macros)]
 // Preserve upstream code and API while avoiding new stylistic warnings that
 // Cargo normally suppresses for registry dependencies.
